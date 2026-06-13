@@ -216,6 +216,10 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     assert cmd[:2] == ["/usr/bin/setsid", "bash"]
     assert "gateway restart" in cmd[-1]
     assert "kill -0 321" in cmd[-1]
+    assert f"[ \"$i\" -lt {gateway_run._DETACHED_RESTART_WAIT_ATTEMPTS} ]" in cmd[-1]
+    assert f"[ \"$i\" -lt {gateway_run._DETACHED_RESTART_TERM_ATTEMPTS} ]" in cmd[-1]
+    assert "kill -TERM 321" in cmd[-1]
+    assert "kill -KILL 321" in cmd[-1]
     assert kwargs["start_new_session"] is True
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL

@@ -135,6 +135,31 @@ _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-]{20,}\b"),
 )
 
+_DETACHED_RESTART_POLL_INTERVAL_SECS = 0.2
+_DETACHED_RESTART_WAIT_ATTEMPTS = 600
+_DETACHED_RESTART_TERM_ATTEMPTS = 50
+
+
+def _detached_restart_shell_command(current_pid: int, hermes_cmd: list[str]) -> str:
+    cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
+    return (
+        f"i=0; "
+        f"while kill -0 {current_pid} 2>/dev/null && [ \"$i\" -lt {_DETACHED_RESTART_WAIT_ATTEMPTS} ]; do "
+        f"sleep {_DETACHED_RESTART_POLL_INTERVAL_SECS}; i=$((i + 1)); "
+        f"done; "
+        f"if kill -0 {current_pid} 2>/dev/null; then "
+        f"kill -TERM {current_pid} 2>/dev/null || true; "
+        f"i=0; "
+        f"while kill -0 {current_pid} 2>/dev/null && [ \"$i\" -lt {_DETACHED_RESTART_TERM_ATTEMPTS} ]; do "
+        f"sleep {_DETACHED_RESTART_POLL_INTERVAL_SECS}; i=$((i + 1)); "
+        f"done; "
+        f"if kill -0 {current_pid} 2>/dev/null; then "
+        f"kill -KILL {current_pid} 2>/dev/null || true; "
+        f"fi; "
+        f"fi; "
+        f"{cmd} gateway restart"
+    )
+
 
 def _ensure_windows_gateway_venv_imports() -> None:
     """Make detached Windows gateway runs see the Hermes venv packages.
@@ -4360,11 +4385,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
-        shell_cmd = (
-            f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
-            f"{cmd} gateway restart"
-        )
+        shell_cmd = _detached_restart_shell_command(current_pid, hermes_cmd)
         # Same marker scrub as the Windows watcher above: this watcher runs
         # `hermes gateway restart` from outside the gateway, but it inherits
         # _HERMES_GATEWAY=1 from us, and the CLI's self-restart loop guard
