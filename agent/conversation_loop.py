@@ -4708,6 +4708,55 @@ def run_conversation(
                                  agent._verification_stop_nudges)
                     continue
 
+                # Shadow-mode verification detector — passive monitoring of
+                # verifiable claims in the final response. In "gate" mode it
+                # can inject a nudge to force actual verification.
+                _shadow_nudge = None
+                try:
+                    from agent.verification_shadow import (
+                        get_shadow_mode,
+                        get_shadow_threshold,
+                        shadow_check,
+                    )
+
+                    _sm = get_shadow_mode(agent)
+                    _st = get_shadow_threshold(agent)
+                    if _sm != "off":
+                        _shadow_result = shadow_check(
+                            response_text=final_msg.get("content", ""),
+                            shadow_mode=_sm,
+                            threshold=_st,
+                        )
+                        if _shadow_result and _shadow_result.get("mode") == "gate":
+                            _shadow_nudge = _shadow_result.get("nudge")
+                except Exception:
+                    logger.debug("verification shadow check failed", exc_info=True)
+
+                if _shadow_nudge:
+                    agent._verification_shadow_nudges = (
+                        getattr(agent, "_verification_shadow_nudges", 0) + 1
+                    )
+                    # Cap at 3 attempts to prevent infinite loops
+                    if agent._verification_shadow_nudges <= 3:
+                        final_msg["finish_reason"] = "verification_required"
+                        messages.append(final_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": _shadow_nudge,
+                            "_verification_stop_synthetic": True,
+                        })
+                        agent._session_messages = messages
+                        logger.debug(
+                            "verification shadow nudge issued (attempt %d)",
+                            agent._verification_shadow_nudges,
+                        )
+                        continue
+                    else:
+                        logger.warning(
+                            "verification shadow: exceeded 3 attempts, "
+                            "releasing response"
+                        )
+
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
