@@ -795,7 +795,34 @@ class LocalEnvironment(BaseEnvironment):
 
         try:
             if _IS_WINDOWS:
-                proc.terminate()
+                # proc.terminate() alone only kills the bash wrapper; any
+                # children it spawned (GUI apps launched via `start`, a
+                # foreground python driving UI automation, dev servers) keep
+                # running AND hold the inherited stdout pipe open, so the
+                # drain never EOFs and the command hangs past its timeout.
+                # The hermes-eats-world sidecar pinned Discord sessions for
+                # the full gateway inactivity window this way. taskkill /T
+                # reaps the whole process tree; /F forces termination.
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except Exception:
+                    pass
+                # Belt-and-suspenders: ensure the wrapper itself is gone even
+                # if taskkill was unavailable or raced the process exit.
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
             else:
                 try:
                     pgid = os.getpgid(proc.pid)
