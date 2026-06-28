@@ -992,7 +992,7 @@ DEFAULT_CONFIG = {
         # (it fired on doc/markdown/skill edits too). Set true to opt in, or
         # "auto" for the legacy surface-aware behavior (on for interactive
         # coding surfaces, off for conversational messaging surfaces).
-        "verify_on_stop": False,
+        "verify_on_stop": True,
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
@@ -2974,7 +2974,7 @@ DEFAULT_CONFIG = {
 
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 31,
+    "_config_version": 32,
 }
 
 # =============================================================================
@@ -5332,6 +5332,32 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "  ✓ Turned off verify-on-stop (agent.verify_on_stop: false). "
                     "Set it to true to re-enable, or \"auto\" for the legacy "
                     "surface-aware behavior."
+                )
+
+    # ── Version 31 → 32: switch verify_on_stop ON (one-time) ──
+    # The v30→v31 migration turned verify_on_stop OFF because the old
+    # verification narrative was more noise than signal. The new
+    # verification-enforcement guidance (T-A1) and evidence-based
+    # verification_stop module make it useful again. This migration
+    # flips it back ON for users who never expressed an explicit
+    # preference (i.e. the value is the v31 default of False).
+    # An explicit true/false/on/off the user set is preserved.
+    if current_ver < 32:
+        config = read_raw_config()
+        raw_agent = config.get("agent")
+        if not isinstance(raw_agent, dict):
+            raw_agent = {}
+        cur = raw_agent.get("verify_on_stop")
+        # Only flip the v31 default (False); leave explicit user choices alone.
+        if cur is False:
+            raw_agent["verify_on_stop"] = True
+            config["agent"] = raw_agent
+            save_config(config)
+            results["config_added"].append("agent.verify_on_stop=true")
+            if not quiet:
+                print(
+                    "  ✓ Enabled verify-on-stop (agent.verify_on_stop: true). "
+                    "Set it to false to disable."
                 )
 
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
