@@ -588,6 +588,11 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
+    # Per-turn reset of the shadow verification-nudge budget so the 3-attempt
+    # cap in the loop below applies per user turn, not cumulatively across a
+    # whole session (the counter lives on `agent`, which persists per session).
+    agent._verification_shadow_nudges = 0
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
