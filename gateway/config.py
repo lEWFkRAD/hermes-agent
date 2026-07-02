@@ -526,6 +526,13 @@ class PlatformConfig:
                 if isinstance(ov_data, dict):
                     channel_overrides[str(cid)] = ChannelOverride.from_dict(ov_data)
 
+        channel_overrides: Dict[str, ChannelOverride] = {}
+        raw_overrides = data.get("channel_overrides") or {}
+        if isinstance(raw_overrides, dict):
+            for cid, ov_data in raw_overrides.items():
+                if isinstance(ov_data, dict):
+                    channel_overrides[str(cid)] = ChannelOverride.from_dict(ov_data)
+
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -609,6 +616,43 @@ class StreamingConfig:
             fresh_final_after_seconds=_coerce_float(
                 data.get("fresh_final_after_seconds"), 0.0
             ),
+        )
+
+
+@dataclass
+class PrefixWarmerConfig:
+    """Configuration for the local-backend prompt prefix warmer.
+
+    When enabled, the gateway periodically replays a tiny request carrying the
+    shared prompt prefix (tool schemas + system message) of the most recent
+    request sent to each *local* endpoint, so the server keeps a cached state
+    fresh sessions can reuse instead of re-prefilling the whole prefix. See
+    ``gateway/prefix_warmer.py`` for mechanics. Off by default: it only helps
+    llama.cpp-style local backends, and costs one 1-token request per interval.
+    """
+    enabled: bool = False
+    # Seconds between warm cycles. Local server caches are typically evicted
+    # by competing traffic rather than time, so a few minutes is plenty.
+    interval_seconds: int = 240
+    # Per-request timeout — generous enough to cover a full cold prefill of a
+    # large prefix on modest hardware.
+    timeout_seconds: float = 120.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "interval_seconds": self.interval_seconds,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PrefixWarmerConfig":
+        if not data:
+            return cls()
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            interval_seconds=_coerce_int(data.get("interval_seconds"), 240),
+            timeout_seconds=_coerce_float(data.get("timeout_seconds"), 120.0),
         )
 
 
@@ -713,6 +757,9 @@ class GatewayConfig:
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+
+    # Local-backend prompt prefix warmer (see PrefixWarmerConfig)
+    prefix_warmer: PrefixWarmerConfig = field(default_factory=PrefixWarmerConfig)
 
     # Session store pruning: drop SessionEntry records older than this many
     # days from the in-memory dict and sessions.json.  Keeps the store from
@@ -826,6 +873,7 @@ class GatewayConfig:
             "multiplex_profiles": self.multiplex_profiles,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
+            "prefix_warmer": self.prefix_warmer.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
         }
     
@@ -940,6 +988,7 @@ class GatewayConfig:
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+            prefix_warmer=PrefixWarmerConfig.from_dict(data.get("prefix_warmer", {})),
             session_store_max_age_days=session_store_max_age_days,
         )
 
@@ -1075,6 +1124,14 @@ def load_gateway_config() -> GatewayConfig:
                 )
             if isinstance(streaming_cfg, dict):
                 gw_data["streaming"] = streaming_cfg
+
+            prefix_warmer_cfg = yaml_cfg.get("prefix_warmer")
+            if not isinstance(prefix_warmer_cfg, dict):
+                # Fall back to nested gateway.prefix_warmer written by
+                # ``hermes config set gateway.prefix_warmer.*``
+                prefix_warmer_cfg = yaml_cfg.get("gateway", {}).get("prefix_warmer")
+            if isinstance(prefix_warmer_cfg, dict):
+                gw_data["prefix_warmer"] = prefix_warmer_cfg
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
