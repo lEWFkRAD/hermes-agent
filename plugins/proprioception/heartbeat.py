@@ -199,7 +199,11 @@ def _baseline_body(
             signal = True
             parts.append(f"overall verdict: {verdict}")
     else:
-        signal = True
+        # A cold-start fetch miss is usually the dashboard's own collection
+        # cycle briefly blocking its single-threaded listener — with no prior
+        # reading to compare against, announcing "feed unreachable" would be
+        # a likely false alarm. Stay silent; a real outage is reported as a
+        # sensor-loss transition on a later turn (where history exists).
         parts.append("host status feed unreachable (no external readings available)")
     if snap.gateway is not None and snap.gateway_state not in ("running", "ok"):
         signal = True
