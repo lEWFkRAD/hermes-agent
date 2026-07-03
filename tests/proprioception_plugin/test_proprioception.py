@@ -1,11 +1,12 @@
 """Tests for the proprioception plugin (settings, collector, heartbeat, tool).
 
-Windows note: run this file in isolation (the full agent tree has known
-cross-file order pollution on native Windows; these tests are self-contained).
+Windows note: safe to run standalone; module globals are reset by the
+autouse fixture, so the file should also survive full-tree runs.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Dict
 
@@ -24,7 +25,7 @@ def _settings(**overrides: Any) -> Dict[str, Any]:
     cfg = dict(DEFAULTS)
     cfg.update(
         enabled=True,
-        cache_ttl_seconds=1,  # floor in sanitizer; raw dict here so any value works
+        cache_ttl_seconds=1,
         min_interval_seconds=0,
     )
     cfg.update(overrides)
@@ -68,6 +69,14 @@ def _install_dashboard(monkeypatch, payload_or_exc):
     return calls
 
 
+def _enable_config(monkeypatch):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly", lambda: {"proprioception": {"enabled": True}}
+    )
+
+
 # ---------------------------------------------------------------------------
 # settings
 # ---------------------------------------------------------------------------
@@ -105,14 +114,22 @@ def test_settings_sanitizes_garbage(monkeypatch):
     assert cfg["max_chars"] == 100  # floored
 
 
-def test_settings_config_read_failure_is_disabled(monkeypatch):
+def test_settings_config_read_failure_is_disabled_and_warns_once(monkeypatch, caplog):
+    import logging
+
     import hermes_cli.config as config_mod
+    import plugins.proprioception.settings as settings_mod
 
     def boom():
         raise RuntimeError("config exploded")
 
     monkeypatch.setattr(config_mod, "load_config_readonly", boom)
-    assert get_settings()["enabled"] is False
+    monkeypatch.setattr(settings_mod, "_warned_config_failure", False)
+    with caplog.at_level(logging.WARNING):
+        assert get_settings()["enabled"] is False
+        assert get_settings()["enabled"] is False
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # latched, not per-call
 
 
 def test_settings_non_dict_block_ignored(monkeypatch):
@@ -144,10 +161,65 @@ def test_snapshot_sensor_failure_is_data_not_exception(monkeypatch):
     assert "dashboard" in snap.sensors_down
 
 
-def test_fingerprint_ignores_detail_noise(monkeypatch):
-    a = collector.Snapshot(fetched_at=0, dashboard=_dashboard_payload({"gpu": "ok"}))
-    b = collector.Snapshot(fetched_at=1, dashboard=_dashboard_payload({"gpu": "ok"}))
-    b.dashboard["systems"][0]["detail"] = "38C, 2.1 GiB free"  # detail differs
+def test_stale_while_revalidate_does_not_block_second_caller(monkeypatch):
+    """A slow refresh must not serialize other sessions' prologues."""
+    payload = _dashboard_payload({"agg": "ok"})
+    release = threading.Event()
+
+    def slow_fetch(url, timeout):
+        release.wait(5)
+        return payload
+
+    cfg = _settings(cache_ttl_seconds=0.001 if False else 1)
+    # Prime the cache with a fast fetch.
+    _install_dashboard(monkeypatch, payload)
+    collector.get_snapshot(cfg)
+    # Expire it and make the next fetch hang.
+    monkeypatch.setattr(collector, "_fetch_dashboard", slow_fetch)
+    monkeypatch.setattr(collector, "_CACHED", collector.Snapshot(
+        fetched_at=time.monotonic() - 100, dashboard=payload))
+
+    slow_started = threading.Event()
+
+    def refresher():
+        slow_started.set()
+        collector.get_snapshot(cfg)
+
+    t = threading.Thread(target=refresher)
+    t.start()
+    slow_started.wait(2)
+    time.sleep(0.05)  # let the refresher enter the fetch
+    start = time.monotonic()
+    snap = collector.get_snapshot(cfg)  # must be served stale immediately
+    elapsed = time.monotonic() - start
+    release.set()
+    t.join(timeout=5)
+    assert elapsed < 1.0, f"second caller blocked {elapsed:.2f}s behind the fetch"
+    assert snap.dashboard is not None
+
+
+def test_grace_window_marks_data_stale(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    collector.get_snapshot(_settings())
+    monkeypatch.setattr(collector, "_CACHED", None)
+    monkeypatch.setattr(collector, "_LAST_GOOD_AT", time.monotonic() - 30)
+    _install_dashboard(monkeypatch, ConnectionError("refused"))
+    snap = collector.get_snapshot(_settings(stale_grace_seconds=90))
+    assert snap.dashboard is not None  # grace served the old data
+    assert snap.dashboard_stale_for >= 30  # ...but discloses its age
+    assert snap.dashboard_error  # ...and keeps the error visible
+
+
+def test_fingerprint_ignores_detail_and_needs_noise():
+    a = collector.Snapshot(
+        fetched_at=0,
+        dashboard=_dashboard_payload({"gpu": "ok"}, needs=[{"sev": "warn", "text": "14 hours"}]),
+    )
+    b = collector.Snapshot(
+        fetched_at=1,
+        dashboard=_dashboard_payload({"gpu": "ok"}, needs=[{"sev": "warn", "text": "15 hours"}]),
+    )
+    b.dashboard["systems"][0]["detail"] = "38C, 2.1 GiB free"
     assert collector.fingerprint(a) == collector.fingerprint(b)
 
 
@@ -165,7 +237,6 @@ def test_diff_systems_reports_transitions_and_absences():
     transitions = collector.diff_systems(a, b)
     assert ("label-agg", "ok", "absent") in transitions
     assert ("label-vision", "ok", "down") in transitions
-    assert collector.has_degradation(transitions)
 
 
 # ---------------------------------------------------------------------------
@@ -175,121 +246,210 @@ def test_diff_systems_reports_transitions_and_absences():
 def _beat(session="s1", history=None, cfg=None):
     return heartbeat.build_heartbeat(
         session_id=session,
-        is_first_turn=False,
         conversation_history=history,
         settings=cfg or _settings(),
     )
 
 
-def test_baseline_fires_once_then_silence(monkeypatch):
+def _refetch(monkeypatch, payload_or_exc):
+    """Expire the collector cache and point it at new data."""
+    collector.reset_cache_for_tests()
+    return _install_dashboard(monkeypatch, payload_or_exc)
+
+
+def test_all_green_baseline_is_silent(monkeypatch):
     _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok", "vision": "ok"}))
+    assert _beat() is None  # nothing to report; silence is the baseline
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok", "vision": "ok"}))
+    assert _beat() is None  # steady state stays silent
+
+
+def test_baseline_with_signal_fires_and_is_fenced(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok", "vision": "warn"}))
     first = _beat()
     assert first is not None
-    assert "baseline" in first.lower()
-    assert "2" in first  # system count
-    collector.reset_cache_for_tests()  # force refetch; same payload
-    assert _beat() is None  # steady state costs zero tokens
+    assert first.startswith("<host-telemetry>") and first.rstrip().endswith("</host-telemetry>")
+    assert "NOT part of the user's message" in first
+    assert "label-vision" in first
+    # No second-person machine talk.
+    assert "your own machine" not in first.lower()
 
 
-def test_state_transition_fires_and_names_the_system(monkeypatch):
+def test_state_transition_fires_names_system_and_rotates_frames(monkeypatch):
     _install_dashboard(monkeypatch, _dashboard_payload({"vision": "ok"}))
-    _beat()
-    collector.reset_cache_for_tests()
-    _install_dashboard(monkeypatch, _dashboard_payload({"vision": "down"}))
+    assert _beat() is None  # green baseline, silent
+    _refetch(monkeypatch, _dashboard_payload({"vision": "down"}))
     beat = _beat(cfg=_settings(min_interval_seconds=10_000))  # degradation bypasses limit
     assert beat is not None
-    assert "label-vision" in beat
-    assert "DOWN" in beat
+    assert "label-vision" in beat and "DOWN" in beat
+
+
+def test_flapping_system_cannot_bypass_rate_limit_twice(monkeypatch):
+    cfg = _settings(min_interval_seconds=10_000)
+    _install_dashboard(monkeypatch, _dashboard_payload({"tg": "ok"}))
+    _beat(cfg=cfg)
+    _refetch(monkeypatch, _dashboard_payload({"tg": "warn"}))
+    assert _beat(cfg=cfg) is not None  # first edge: bypass fires
+    _refetch(monkeypatch, _dashboard_payload({"tg": "ok"}))
+    assert _beat(cfg=cfg) is None  # recovery: rate-limited
+    _refetch(monkeypatch, _dashboard_payload({"tg": "warn"}))
+    assert _beat(cfg=cfg) is None  # same edge again inside bypass memory: no bypass
 
 
 def test_recovery_respects_rate_limit_then_reports(monkeypatch):
     _install_dashboard(monkeypatch, _dashboard_payload({"vision": "down"}))
     cfg = _settings(min_interval_seconds=10_000)
-    _beat(cfg=cfg)
-    collector.reset_cache_for_tests()
-    _install_dashboard(monkeypatch, _dashboard_payload({"vision": "ok"}))
+    _beat(cfg=cfg)  # baseline (has signal)
+    _refetch(monkeypatch, _dashboard_payload({"vision": "ok"}))
     # recovery (down -> ok) is not a degradation; rate limit suppresses it...
     assert _beat(cfg=cfg) is None
     # ...but the un-emitted change is retained, and reports once the window opens
-    collector.reset_cache_for_tests()
-    _install_dashboard(monkeypatch, _dashboard_payload({"vision": "ok"}))
+    _refetch(monkeypatch, _dashboard_payload({"vision": "ok"}))
     beat = _beat(cfg=_settings(min_interval_seconds=0))
     assert beat is not None and "label-vision" in beat
 
 
-def test_single_missed_poll_is_absorbed_by_grace_window(monkeypatch):
+def test_flap_within_rate_window_nets_to_silence(monkeypatch):
+    cfg_limited = _settings(min_interval_seconds=10_000)
+    _install_dashboard(monkeypatch, _dashboard_payload({"x": "warn"}))
+    _beat(cfg=cfg_limited)  # baseline w/ signal
+    _refetch(monkeypatch, _dashboard_payload({"x": "ok"}))
+    assert _beat(cfg=cfg_limited) is None  # suppressed recovery
+    _refetch(monkeypatch, _dashboard_payload({"x": "warn"}))
+    # back to the original state: no net change; must stay silent even
+    # with the rate window wide open
+    assert _beat(cfg=_settings(min_interval_seconds=0)) is None
+
+
+def test_sensor_outage_bridge_does_not_swallow_recovery(monkeypatch):
+    """down -> (dashboard outage) -> ok must still report the recovery."""
+    cfg = _settings(min_interval_seconds=0, stale_grace_seconds=0)
+    _install_dashboard(monkeypatch, _dashboard_payload({"vision": "down"}))
+    _beat(cfg=cfg)  # baseline: vision down
+    _refetch(monkeypatch, ConnectionError("refused"))
+    lost = _beat(cfg=cfg)
+    assert lost is not None and "status feed" in lost  # sensor loss reported
+    _refetch(monkeypatch, _dashboard_payload({"vision": "ok"}))
+    back = _beat(cfg=cfg)
+    assert back is not None
+    assert "label-vision" in back  # the down->ok transition survived the outage
+    assert "back online" in back
+
+
+def test_gateway_state_change_renders_named_line(monkeypatch):
+    cfg = _settings(min_interval_seconds=0)
     _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
-    _beat()
-    # Fetch fails, but the last good reading is fresh -> no loss chatter.
-    monkeypatch.setattr(collector, "_CACHED", None)
-    _install_dashboard(monkeypatch, ConnectionError("refused"))
-    assert _beat() is None
-
-
-def test_sustained_sensor_loss_reported_as_state(monkeypatch):
-    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
-    _beat()
-    # Age the last good reading past the grace window, then fail the fetch.
-    monkeypatch.setattr(collector, "_CACHED", None)
-    monkeypatch.setattr(collector, "_LAST_GOOD_AT", time.time() - 10_000)
-    _install_dashboard(monkeypatch, ConnectionError("refused"))
-    beat = _beat()
-    assert beat is not None
-    assert "sensor" in beat.lower()
-
-
-def test_context_bucket_crossing_fires(monkeypatch):
-    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
-    small = [{"role": "user", "content": "x" * 400}]  # ~100 tokens
-    _beat(history=small, cfg=_settings(context_window=2048))
+    monkeypatch.setattr(collector, "_fetch_gateway_status", lambda: {"state": "running"})
+    _beat(cfg=cfg)
     collector.reset_cache_for_tests()
     _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
-    big = [{"role": "user", "content": "x" * 6000}]  # ~1500 tokens of 2048 = 73%
-    beat = _beat(history=big, cfg=_settings(context_window=2048))
+    monkeypatch.setattr(collector, "_fetch_gateway_status", lambda: {"state": "draining"})
+    beat = _beat(cfg=cfg)
     assert beat is not None
-    assert "context fill" in beat
+    assert "gateway: running -> draining" in beat  # never an empty change body
+
+
+def test_needs_text_churn_emits_nothing(monkeypatch):
+    cfg = _settings(min_interval_seconds=0)
+    _install_dashboard(
+        monkeypatch,
+        _dashboard_payload({"agg": "ok"}, needs=[{"sev": "warn", "text": "stale 14h"}]),
+    )
+    _beat(cfg=cfg)
+    _refetch(
+        monkeypatch,
+        _dashboard_payload({"agg": "ok"}, needs=[{"sev": "warn", "text": "stale 15h"}]),
+    )
+    assert _beat(cfg=cfg) is None  # churn in operator text is not a state change
+
+
+def test_context_upward_crossing_fires_downward_is_silent(monkeypatch):
+    cfg = lambda: _settings(context_window=2048, min_interval_seconds=0)  # noqa: E731
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    small = [{"role": "user", "content": "x" * 400}]
+    assert _beat(history=small, cfg=cfg()) is None  # green baseline, low fill
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    big = [{"role": "user", "content": "x" * 6000}]  # ~1500/2048 = 73%
+    up = _beat(history=big, cfg=cfg())
+    assert up is not None and "context fill climbed past" in up
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    # Compression dropped fill back down: silent re-bucket.
+    assert _beat(history=small, cfg=cfg()) is None
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    # Climb again: reports again.
+    again = _beat(history=big, cfg=cfg())
+    assert again is not None and "context fill" in again
+
+
+def test_slow_creep_through_threshold_still_reports(monkeypatch):
+    cfg = lambda: _settings(context_window=1000, min_interval_seconds=0)  # noqa: E731
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    # 40% — below every threshold: green baseline, silent
+    low = [{"role": "user", "content": "x" * (400 * 4)}]
+    assert _beat(history=low, cfg=cfg()) is None
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    # 51% — inside the hysteresis band (50% + 2%): silent, bucket must NOT advance
+    mid = [{"role": "user", "content": "x" * (510 * 4)}]
+    assert _beat(history=mid, cfg=cfg()) is None
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    # 55% — clears the band: the 50% crossing must be reported, not swallowed
+    over = [{"role": "user", "content": "x" * (550 * 4)}]
+    beat = _beat(history=over, cfg=cfg())
+    assert beat is not None and "context fill climbed past 50%" in beat
 
 
 def test_mode_off_is_silent(monkeypatch):
-    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "warn"}))
     assert _beat(cfg=_settings(heartbeat="off")) is None
 
 
-def test_mode_always_emits_every_turn(monkeypatch):
+def test_mode_always_emits_every_turn_with_rotation(monkeypatch):
     _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
     cfg = _settings(heartbeat="always")
-    assert _beat(cfg=cfg) is not None
-    assert _beat(cfg=cfg) is not None
+    first = _beat(cfg=cfg)
+    second = _beat(cfg=cfg)
+    third = _beat(cfg=cfg)
+    assert first and second and third
+    assert "First status reading" in first
+    assert "Periodic reading" in second
+    assert second != third  # frames rotate; no byte-identical repeats
 
 
 def test_sessions_are_isolated(monkeypatch):
-    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "warn"}))
     assert _beat(session="a") is not None
     assert _beat(session="b") is not None  # b gets its own baseline
     assert _beat(session="a") is None
 
 
-def test_truncation_respects_max_chars(monkeypatch):
+def test_truncation_keeps_fence_intact(monkeypatch):
     _install_dashboard(
         monkeypatch,
-        _dashboard_payload({f"sys{i}": "ok" for i in range(30)}),
+        _dashboard_payload({f"sys{i}": "warn" for i in range(30)}),
     )
-    beat = _beat(cfg=_settings(max_chars=120))
-    assert beat is not None and len(beat) <= 120
+    beat = _beat(cfg=_settings(max_chars=400))
+    assert beat is not None and len(beat) <= 400
+    assert beat.startswith("<host-telemetry>")
+    assert beat.rstrip().endswith("</host-telemetry>")
 
 
 def test_heartbeat_never_raises(monkeypatch):
-    # Even a hostile payload shape must not raise out of build_heartbeat's caller.
     _install_dashboard(monkeypatch, {"systems": [None, 42, {"id": None}], "needs": None})
     from plugins.proprioception import _pre_llm_call
 
-    import hermes_cli.config as config_mod
-
-    monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: {"proprioception": {"enabled": True}}
-    )
+    _enable_config(monkeypatch)
     result = _pre_llm_call(session_id="s", conversation_history=None, is_first_turn=True)
     assert result is None or isinstance(result, dict)
+
+
+def test_falsy_session_id_gets_thread_scoped_key(monkeypatch):
+    from plugins.proprioception import _pre_llm_call
+
+    _enable_config(monkeypatch)
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "warn"}))
+    r1 = _pre_llm_call(session_id=None, conversation_history=None)
+    assert r1 is not None  # got its own baseline, not swallowed by a shared key
+    assert f"no-session-{threading.get_ident()}" in heartbeat._SESSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -297,42 +457,48 @@ def test_heartbeat_never_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_tool_summary_lists_attention_only(monkeypatch):
-    import hermes_cli.config as config_mod
-
-    monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: {"proprioception": {"enabled": True}}
-    )
+    _enable_config(monkeypatch)
     _install_dashboard(
         monkeypatch,
-        _dashboard_payload({"agg": "ok", "vision": "down"}, needs=[{"sev": "warn", "text": "vision died"}]),
+        _dashboard_payload(
+            {"agg": "ok", "vision": "down"},
+            needs=[{"sev": "warn", "text": "Vision died. Run schtasks /run /tn Fix-It now."}],
+        ),
     )
     out = handle_body_state({"detail": "summary"})
-    assert "attention" in out.lower()
     assert "label-vision" in out
     assert "label-agg" not in out  # ok systems stay out of the summary
+    # Operator text is labeled and trimmed to its first sentence.
+    assert "addressed to the operator" in out
+    assert "Vision died." in out and "schtasks" not in out
 
 
 def test_tool_full_groups_by_category(monkeypatch):
-    import hermes_cli.config as config_mod
-
-    monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: {"proprioception": {"enabled": True}}
-    )
+    _enable_config(monkeypatch)
     _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
     out = handle_body_state({"detail": "full"})
     assert "AI models:" in out
     assert "label-agg" in out
+    assert out.startswith("Host status report.")
 
 
 def test_tool_reports_sensor_outage(monkeypatch):
-    import hermes_cli.config as config_mod
-
-    monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: {"proprioception": {"enabled": True}}
-    )
+    _enable_config(monkeypatch)
     _install_dashboard(monkeypatch, ConnectionError("refused"))
     out = handle_body_state({})
     assert "unreachable" in out.lower()
+
+
+def test_tool_discloses_stale_grace_data(monkeypatch):
+    _enable_config(monkeypatch)
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    collector.get_snapshot(_settings())
+    monkeypatch.setattr(collector, "_CACHED", None)
+    monkeypatch.setattr(collector, "_LAST_GOOD_AT", time.monotonic() - 45)
+    _install_dashboard(monkeypatch, ConnectionError("refused"))
+    out = handle_body_state({})
+    assert "live fetch is failing" in out
+    assert "old" in out  # age disclosed
 
 
 def test_tool_check_fn_fail_closed(monkeypatch):
