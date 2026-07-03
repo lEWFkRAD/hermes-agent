@@ -41,9 +41,16 @@ def _pre_llm_call(**kwargs: Any) -> Optional[dict]:
 
         from plugins.proprioception.heartbeat import build_heartbeat
 
+        # A falsy session id must not collapse distinct conversations into
+        # one shared delta state; fall back to a per-thread key.
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id:
+            import threading
+
+            session_id = f"no-session-{threading.get_ident()}"
+
         text = build_heartbeat(
-            session_id=str(kwargs.get("session_id") or "no-session"),
-            is_first_turn=bool(kwargs.get("is_first_turn")),
+            session_id=session_id,
             conversation_history=kwargs.get("conversation_history"),
             settings=settings,
         )
