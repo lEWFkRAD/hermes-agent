@@ -508,3 +508,13 @@ def test_tool_check_fn_fail_closed(monkeypatch):
 
     monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {})
     assert check_body_state_available() is False
+
+
+def test_cold_start_sensor_miss_is_silent_then_recovers(monkeypatch):
+    """First-ever reading failing to reach the dashboard must not emit a
+    false 'feed unreachable' baseline; a later real loss still reports."""
+    cfg = _settings(stale_grace_seconds=0)
+    _install_dashboard(monkeypatch, ConnectionError("cold miss"))
+    assert _beat(cfg=cfg) is None  # cold miss: silent
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat(cfg=cfg) is not None  # feed coming online IS a transition
