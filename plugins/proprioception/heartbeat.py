@@ -293,6 +293,22 @@ def _decide_locked(
         if delta > 0 and delta >= float(settings["gap_report_seconds"]):
             gap_seconds = delta
 
+    # Optional always-on clock: opt-in temporal grounding. When enabled, a
+    # compact "time + delta since last turn" line is emitted EVERY turn (forcing
+    # emission, bypassing the rate limit) so the model is never time-blind — it
+    # reasons about elapsed time accurately when handed a stamp, and asserts
+    # "0 seconds, confidence 1.0" without one. Trades prefix-cache reuse for the
+    # grounding, hence off by default. (A persisted-in-history stamp would be
+    # cache-optimal; this ephemeral line is the simple first version.)
+    clock_line: Optional[str] = None
+    if settings.get("clock"):
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(wall_now))
+        if state.last_turn_wall is not None and wall_now > state.last_turn_wall:
+            clock_line = (f"clock {ts}, +{_humanize_gap(wall_now - state.last_turn_wall)} "
+                          "since your last turn")
+        else:
+            clock_line = f"clock {ts} (first turn this session)"
+
     # Whether the PREVIOUS turn ran on the primary model runtime. Only trust a
     # record that actually carried data (has_data); otherwise assume unchanged.
     lt = last_turn or {}
@@ -334,13 +350,15 @@ def _decide_locked(
     # --- first reading for this session ---
     if state.fingerprint is None:
         body, signal = _baseline_body(snap, ctx_tokens, window, bucket_down)
-        _record(emitted=signal)
+        if clock_line:
+            body = clock_line + ". " + body
+        _record(emitted=signal or bool(clock_line))
         # Keep "home" as the fallback reference across the baseline: if the very
         # first turn already ran off-primary, we want the next reading to see a
         # True->False transition and report it — not silently adopt the degraded
         # state as normal.
         state.prev_on_primary = True
-        if signal or mode == "always":
+        if signal or clock_line or mode == "always":
             return _wrap(body, settings)
         return None  # all green: silence is the baseline
 
@@ -412,10 +430,12 @@ def _decide_locked(
         else:
             body, _ = _baseline_body(snap, ctx_tokens, window, bucket_down)
             body = body.replace("First status reading this session:", f"Periodic reading — {frame.rstrip(':').lower()}", 1)
+        if clock_line:
+            body = clock_line + ". " + body
         _record(emitted=True)
         return _wrap(body, settings)
 
-    if not lines:
+    if not lines and not clock_line:
         # Includes the fingerprint-changed-but-nothing-renders case (by
         # construction there shouldn't be one) and downward ctx moves:
         # update silently so the same non-event can't re-trigger.
@@ -437,7 +457,8 @@ def _decide_locked(
             fresh_degradation = True
     # A fallback transition or a long suspension gap is a discrete, important
     # event — emit promptly (each is naturally one-shot: the stamp/flag advances).
-    bypass = fresh_degradation or sensor_lost or fallback_transition or (gap_seconds is not None)
+    bypass = (fresh_degradation or sensor_lost or fallback_transition
+              or (gap_seconds is not None) or (clock_line is not None))
 
     if not bypass and (now - state.last_emit) < min_interval:
         # Suppressed: deliberately do NOT update state, so the change is
@@ -454,11 +475,16 @@ def _decide_locked(
 
     frame = _CHANGE_FRAMES[state.emit_count % len(_CHANGE_FRAMES)]
     _record(emitted=True)
-    body = (
-        f"{frame} "
-        + "; ".join(lines)
-        + ". Status only — act on it only if it matters to the user's request."
-    )
+    change_body = ""
+    if lines:
+        change_body = (f"{frame} " + "; ".join(lines)
+                       + ". Status only — act on it only if it matters to the user's request.")
+    if clock_line and change_body:
+        body = clock_line + ". " + change_body
+    elif clock_line:
+        body = clock_line + "."
+    else:
+        body = change_body
     return _wrap(body, settings)
 
 
