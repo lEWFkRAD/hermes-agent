@@ -108,7 +108,11 @@ def handle_body_state(args: Dict[str, Any], **_kw: Any) -> str:
                 lines.append(f"{cat}:")
                 for s in members:
                     icon = _STATE_ICONS.get(str(s.get("state")), f"[{s.get('state')}]")
-                    lines.append(f"  {icon} {s.get('label', s.get('id'))}: {s.get('detail', '')}")
+                    # detail strings are operator-facing and can carry remediation
+                    # imperatives ("roll back the driver", "run schtasks ...").
+                    # Trim to the first sentence, same as needs[], so the model
+                    # never relays operator to-do items to a user as its own.
+                    lines.append(f"  {icon} {s.get('label', s.get('id'))}: {_first_sentence(s.get('detail', ''))}")
         else:
             lines.append(f"{len(systems)} systems tracked; {len(attention)} need attention.")
             for s in attention:
