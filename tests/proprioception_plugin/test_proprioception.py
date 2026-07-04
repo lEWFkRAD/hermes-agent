@@ -269,7 +269,7 @@ def test_baseline_with_signal_fires_and_is_fenced(monkeypatch):
     first = _beat()
     assert first is not None
     assert first.startswith("<host-telemetry>") and first.rstrip().endswith("</host-telemetry>")
-    assert "NOT part of the user's message" in first
+    assert "not the user's words" in first
     assert "label-vision" in first
     # No second-person machine talk.
     assert "your own machine" not in first.lower()
@@ -427,8 +427,10 @@ def test_truncation_keeps_fence_intact(monkeypatch):
         monkeypatch,
         _dashboard_payload({f"sys{i}": "warn" for i in range(30)}),
     )
-    beat = _beat(cfg=_settings(max_chars=400))
-    assert beat is not None and len(beat) <= 400
+    # budget must exceed the fixed fence+system-note overhead (~341 chars) with
+    # room for a truncated body; 500 exercises truncation without starving it.
+    beat = _beat(cfg=_settings(max_chars=500))
+    assert beat is not None and len(beat) <= 500
     assert beat.startswith("<host-telemetry>")
     assert beat.rstrip().endswith("</host-telemetry>")
 
