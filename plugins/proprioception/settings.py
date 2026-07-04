@@ -13,6 +13,8 @@ One config block in ``~/.hermes/config.yaml`` controls everything::
       context_window: 131072       # denominator for context-fill buckets
       max_chars: 700               # heartbeat hard truncation
       gap_report_seconds: 1800     # report a suspension gap once idle wall-time exceeds this
+      clock: false                 # opt-in: emit a compact time+delta EVERY turn (temporal
+                                   #   grounding; trades prefix-cache reuse for it — off by default)
 
 Cost note on ``heartbeat: always``: every emission makes the current
 user message diverge from what history replays next turn, so the
@@ -45,6 +47,7 @@ DEFAULTS: Dict[str, Any] = {
     "context_window": 131072,
     "max_chars": 700,
     "gap_report_seconds": 1800,
+    "clock": False,
 }
 
 _warned_config_failure = False
@@ -80,6 +83,7 @@ def get_settings() -> Dict[str, Any]:
 
     # Sanitize: wrong types must not crash the turn prologue.
     cfg["enabled"] = bool(cfg["enabled"])
+    cfg["clock"] = bool(cfg["clock"])
     if str(cfg["heartbeat"]).lower() not in _VALID_HEARTBEAT_MODES:
         cfg["heartbeat"] = "delta"
     else:
