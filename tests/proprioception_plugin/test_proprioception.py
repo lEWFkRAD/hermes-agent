@@ -583,3 +583,93 @@ def test_session_starting_on_fallback_is_reported_next_turn(monkeypatch):
     _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
     beat = _beat_lt("f5", _OFF)
     assert beat is not None and "fallback runtime" in beat  # caught on turn 2
+
+
+# ---------------------------------------------------------------------------
+# continuity / suspension gap
+# ---------------------------------------------------------------------------
+
+def _backdate_last_turn(session: str, seconds_ago: float) -> None:
+    """Age the session's wall stamp so the next beat sees a suspension gap."""
+    heartbeat._SESSIONS[session].last_turn_wall = time.time() - seconds_ago
+
+
+def test_gap_below_threshold_is_silent(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    cfg = _settings(gap_report_seconds=1800)
+    assert _beat(session="g1", cfg=cfg) is None       # green baseline records a stamp
+    _backdate_last_turn("g1", 600)                    # 10 min < 30 min threshold
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat(session="g1", cfg=cfg) is None        # no gap line
+
+
+def test_gap_over_threshold_emits_and_names_duration(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    cfg = _settings(gap_report_seconds=1800)
+    assert _beat(session="g2", cfg=cfg) is None        # green baseline
+    _backdate_last_turn("g2", 3 * 3600)                # dormant 3h
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    beat = _beat(session="g2", cfg=cfg)
+    assert beat is not None
+    assert "since your last turn" in beat and "3.0 h" in beat
+    assert beat.startswith("<host-telemetry>") and beat.rstrip().endswith("</host-telemetry>")
+
+
+def test_gap_emits_once_then_quiet(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    cfg = _settings(gap_report_seconds=1800)
+    _beat(session="g3", cfg=cfg)                        # baseline
+    _backdate_last_turn("g3", 7200)                     # 2h
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat(session="g3", cfg=cfg) is not None     # reports the gap
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat(session="g3", cfg=cfg) is None         # stamp advanced -> no repeat
+
+
+def test_gap_bypasses_rate_limit(monkeypatch):
+    # Baseline carries a signal so it emits and sets last_emit; then a big gap
+    # must still fire despite a 10k-second floor.
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "warn"}))
+    cfg = _settings(gap_report_seconds=1800, min_interval_seconds=10_000)
+    assert _beat(session="g4", cfg=cfg) is not None     # baseline emitted (warn)
+    _backdate_last_turn("g4", 4 * 3600)
+    _refetch(monkeypatch, _dashboard_payload({"agg": "warn"}))  # no transition, only the gap
+    beat = _beat(session="g4", cfg=cfg)
+    assert beat is not None and "since your last turn" in beat
+
+
+def test_backward_clock_never_reports_gap(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    cfg = _settings(gap_report_seconds=60)
+    _beat(session="g5", cfg=cfg)                        # baseline
+    # Clock jumped backward: the stamp is in the future relative to now.
+    heartbeat._SESSIONS["g5"].last_turn_wall = time.time() + 5000
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat(session="g5", cfg=cfg) is None         # non-positive delta ignored
+
+
+def test_gap_coexists_with_system_transition(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"vision": "ok"}))
+    cfg = _settings(gap_report_seconds=1800)
+    assert _beat(session="g6", cfg=cfg) is None         # green baseline
+    _backdate_last_turn("g6", 2 * 3600)
+    _refetch(monkeypatch, _dashboard_payload({"vision": "down"}))
+    beat = _beat(session="g6", cfg=cfg)
+    assert beat is not None
+    assert "label-vision" in beat and "DOWN" in beat    # transition renders
+    assert "since your last turn" in beat               # ...and so does the gap
+
+
+def test_settings_gap_report_seconds_sanitized(monkeypatch):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: {"proprioception": {"enabled": True, "gap_report_seconds": "nope"}},
+    )
+    assert get_settings()["gap_report_seconds"] == DEFAULTS["gap_report_seconds"]  # garbage -> default
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: {"proprioception": {"enabled": True, "gap_report_seconds": -50}},
+    )
+    assert get_settings()["gap_report_seconds"] == 0  # negative floored
