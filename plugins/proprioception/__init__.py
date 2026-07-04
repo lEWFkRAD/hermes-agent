@@ -55,6 +55,11 @@ def _pre_llm_call(**kwargs: Any) -> Optional[dict]:
             settings=settings,
         )
         if text:
+            # Tell the output firewall a self-signal rode into THIS turn, so it
+            # scans the reply for machine-state leakage before it reaches a user.
+            from plugins.proprioception.firewall import mark_signal_fired
+
+            mark_signal_fired(session_id)
             return {"context": text}
         return None
     except Exception:
@@ -79,3 +84,7 @@ def register(ctx) -> None:
         emoji="🫀",
     )
     ctx.register_hook("pre_llm_call", _pre_llm_call)
+
+    from plugins.proprioception.firewall import transform_llm_output
+
+    ctx.register_hook("transform_llm_output", transform_llm_output)
