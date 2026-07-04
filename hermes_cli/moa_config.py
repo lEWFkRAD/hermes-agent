@@ -307,6 +307,12 @@ def _default_preset() -> dict[str, Any]:
         "reference_max_tokens": None,
         "fanout": "user_turn",
         "enabled": True,
+        # Opt-in recency-weighted "brief" advisory view (default OFF preserves
+        # the full-transcript behaviour). See agent/moa_loop._brief_reference_messages.
+        "reference_brief": False,
+        "reference_recent_turns": 4,
+        "reference_context_budget": 24000,
+        "reference_constraints": "",
     }
 
 
@@ -366,6 +372,13 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         # last advisor run. Also accepts the mapping form
         # {mode: every_n, n: N}, normalized to the canonical string.
         "fanout": _coerce_fanout(raw.get("fanout")),
+        # Opt-in brief advisory view (default OFF). recent_turns / context_budget
+        # shape the recency window + total input clamp; constraints is an optional
+        # durable line pinned into the task frame.
+        "reference_brief": bool(raw.get("reference_brief", False)),
+        "reference_recent_turns": _coerce_int(raw.get("reference_recent_turns"), 4),
+        "reference_context_budget": _coerce_int(raw.get("reference_context_budget"), 24000),
+        "reference_constraints": str(raw.get("reference_constraints") or ""),
     }
 
 
