@@ -12,6 +12,7 @@ One config block in ``~/.hermes/config.yaml`` controls everything::
       dashboard_url: http://127.0.0.1:8787/api/home
       context_window: 131072       # denominator for context-fill buckets
       max_chars: 700               # heartbeat hard truncation
+      gap_report_seconds: 1800     # report a suspension gap once idle wall-time exceeds this
 
 Cost note on ``heartbeat: always``: every emission makes the current
 user message diverge from what history replays next turn, so the
@@ -43,6 +44,7 @@ DEFAULTS: Dict[str, Any] = {
     "dashboard_url": "http://127.0.0.1:8787/api/home",
     "context_window": 131072,
     "max_chars": 700,
+    "gap_report_seconds": 1800,
 }
 
 _warned_config_failure = False
@@ -89,6 +91,7 @@ def get_settings() -> Dict[str, Any]:
         ("timeout_seconds", 0.2),
         ("context_window", 1024),
         ("max_chars", 100),
+        ("gap_report_seconds", 0),
     ):
         try:
             value = float(cfg[numeric_key])
