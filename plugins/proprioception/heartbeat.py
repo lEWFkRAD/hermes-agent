@@ -53,9 +53,10 @@ _BYPASS_MEMORY_SECONDS = 600.0
 _FENCE_OPEN = "<host-telemetry>"
 _FENCE_CLOSE = "</host-telemetry>"
 _SYSTEM_NOTE = (
-    "[System note: automated status of the machine this assistant runs on — "
-    "NOT part of the user's message. Do not volunteer or mention it to the "
-    "user unless they ask, or it directly affects their request.]"
+    "[System note: host status for this assistant's own machine — not the user's "
+    "words, not a feeling to perform. Reason with it; never narrate your own state. "
+    "Mention it only if the user asks about system status, or a component their "
+    "request needs is down (then say what it means for their task, not the infra).]"
 )
 
 # Rotating sentence frames for change messages. With ephemeral injection
