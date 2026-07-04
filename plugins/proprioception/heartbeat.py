@@ -95,6 +95,7 @@ class _SessionState:
         "prev_verdict",
         "prev_on_primary",
         "bypass_memory",
+        "last_turn_wall",
     )
 
     def __init__(self) -> None:
@@ -115,6 +116,11 @@ class _SessionState:
         # True (assume home); flips when last_turn telemetry reports a fallback.
         self.prev_on_primary: bool = True
         self.bypass_memory: Dict[Tuple[str, str], float] = {}
+        # Wall-clock stamp of this session's previous turn. Wall, not
+        # monotonic, on purpose: we want real elapsed time across a
+        # suspension/idle gap, including any time the machine spent asleep.
+        # None until the first turn records one.
+        self.last_turn_wall: Optional[float] = None
 
 
 _SESSIONS_LOCK = threading.Lock()
@@ -157,6 +163,19 @@ def _fmt_tokens(tokens: int) -> str:
     if tokens >= 1000:
         return f"~{tokens / 1000:.0f}k"
     return f"~{tokens}"
+
+
+def _humanize_gap(seconds: float) -> str:
+    """Coarse human duration for a suspension gap: 45s / 20 min / 2.5 h / 3.1 days."""
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    minutes = seconds / 60.0
+    if minutes < 90:
+        return f"{minutes:.0f} min"
+    hours = minutes / 60.0
+    if hours < 48:
+        return f"{hours:.1f} h"
+    return f"{hours / 24.0:.1f} days"
 
 
 def _wrap(body: str, settings: Dict[str, Any]) -> str:
@@ -261,6 +280,18 @@ def _decide_locked(
     last_turn: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     now = time.monotonic()
+    wall_now = time.time()
+
+    # Suspension/continuity sense: real wall-clock time elapsed since this
+    # session's previous turn. Wall clock (not monotonic) so a machine that
+    # slept counts the sleep. Reported once, when the gap clears the configured
+    # threshold; the stamp advances every turn so it cannot repeat. A backward
+    # clock (skew/NTP) yields a non-positive delta and is ignored.
+    gap_seconds: Optional[float] = None
+    if state.last_turn_wall is not None:
+        delta = wall_now - state.last_turn_wall
+        if delta > 0 and delta >= float(settings["gap_report_seconds"]):
+            gap_seconds = delta
 
     # Whether the PREVIOUS turn ran on the primary model runtime. Only trust a
     # record that actually carried data (has_data); otherwise assume unchanged.
@@ -295,6 +326,7 @@ def _decide_locked(
             str(snap.dashboard.get("verdict", "")) if snap.dashboard is not None else ""
         )
         state.prev_on_primary = cur_on_primary
+        state.last_turn_wall = wall_now
         if emitted:
             state.last_emit = now
             state.emit_count += 1
@@ -366,6 +398,13 @@ def _decide_locked(
             f"(now ~{pct:.0f}% of {_fmt_tokens(window)})"
         )
 
+    if gap_seconds is not None:
+        lines.append(
+            f"~{_humanize_gap(gap_seconds)} elapsed since your last turn "
+            "(idle/suspended between turns) — time-sensitive state (system "
+            "health, running jobs, the clock) may have moved on since"
+        )
+
     if mode == "always":
         frame = _CHANGE_FRAMES[state.emit_count % len(_CHANGE_FRAMES)]
         if lines:
@@ -396,8 +435,9 @@ def _decide_locked(
     for edge in degraded_edges:
         if now - state.bypass_memory.get(edge, -_BYPASS_MEMORY_SECONDS) >= _BYPASS_MEMORY_SECONDS:
             fresh_degradation = True
-    # A fallback transition is a discrete, important event — emit promptly.
-    bypass = fresh_degradation or sensor_lost or fallback_transition
+    # A fallback transition or a long suspension gap is a discrete, important
+    # event — emit promptly (each is naturally one-shot: the stamp/flag advances).
+    bypass = fresh_degradation or sensor_lost or fallback_transition or (gap_seconds is not None)
 
     if not bypass and (now - state.last_emit) < min_interval:
         # Suppressed: deliberately do NOT update state, so the change is
