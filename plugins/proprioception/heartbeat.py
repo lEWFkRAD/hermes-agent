@@ -93,6 +93,7 @@ class _SessionState:
         "prev_sensors_down",
         "prev_gateway_state",
         "prev_verdict",
+        "prev_on_primary",
         "bypass_memory",
     )
 
@@ -110,6 +111,9 @@ class _SessionState:
         self.prev_sensors_down: Tuple[str, ...] = ()
         self.prev_gateway_state: str = ""
         self.prev_verdict: str = ""
+        # Whether the previous turn ran on the primary model runtime. Starts
+        # True (assume home); flips when last_turn telemetry reports a fallback.
+        self.prev_on_primary: bool = True
         self.bypass_memory: Dict[Tuple[str, str], float] = {}
 
 
@@ -221,8 +225,14 @@ def build_heartbeat(
     session_id: str,
     conversation_history: Optional[List[Dict[str, Any]]],
     settings: Dict[str, Any],
+    last_turn: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Return heartbeat text for this turn, or ``None`` to stay silent."""
+    """Return heartbeat text for this turn, or ``None`` to stay silent.
+
+    ``last_turn`` is the core turn-telemetry record (agent/turn_telemetry.py)
+    describing the PREVIOUS turn's outcome — used to notice when the agent
+    silently ran off its primary model runtime.
+    """
     mode = settings["heartbeat"]
     if mode == "off":
         return None
@@ -237,7 +247,7 @@ def build_heartbeat(
 
     state = _session_state(session_id)
     with state.lock:
-        return _decide_locked(state, snap, fp, ctx_tokens, window, mode, settings)
+        return _decide_locked(state, snap, fp, ctx_tokens, window, mode, settings, last_turn)
 
 
 def _decide_locked(
@@ -248,8 +258,17 @@ def _decide_locked(
     window: int,
     mode: str,
     settings: Dict[str, Any],
+    last_turn: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     now = time.monotonic()
+
+    # Whether the PREVIOUS turn ran on the primary model runtime. Only trust a
+    # record that actually carried data (has_data); otherwise assume unchanged.
+    lt = last_turn or {}
+    if lt.get("has_data"):
+        cur_on_primary = not bool(lt.get("was_fallback"))
+    else:
+        cur_on_primary = state.prev_on_primary
 
     # Bucket update rule: climb only past threshold+hysteresis (and report
     # it); fall silently on any drop below a threshold (compression just
@@ -275,6 +294,7 @@ def _decide_locked(
         state.prev_verdict = (
             str(snap.dashboard.get("verdict", "")) if snap.dashboard is not None else ""
         )
+        state.prev_on_primary = cur_on_primary
         if emitted:
             state.last_emit = now
             state.emit_count += 1
@@ -283,6 +303,11 @@ def _decide_locked(
     if state.fingerprint is None:
         body, signal = _baseline_body(snap, ctx_tokens, window, bucket_down)
         _record(emitted=signal)
+        # Keep "home" as the fallback reference across the baseline: if the very
+        # first turn already ran off-primary, we want the next reading to see a
+        # True->False transition and report it — not silently adopt the degraded
+        # state as normal.
+        state.prev_on_primary = True
         if signal or mode == "always":
             return _wrap(body, settings)
         return None  # all green: silence is the baseline
@@ -304,6 +329,23 @@ def _decide_locked(
         lines.append(f"lost the {sensor} status feed (unreachable)")
     for sensor in sorted(prev_down - cur_down):
         lines.append(f"{sensor} status feed back online")
+
+    # Fallback awareness: did the previous turn silently run off the primary
+    # model? Report the TRANSITION only (not every degraded turn). Framed as
+    # "off primary", never "cloud" — the output firewall + system-note keep it
+    # from reaching a user; this line is for the agent's own reasoning.
+    fallback_transition = False
+    if state.prev_on_primary and not cur_on_primary:
+        fallback_transition = True
+        primary = str(lt.get("primary_model") or lt.get("primary_provider") or "your primary model")
+        served = str(lt.get("provider") or "a fallback runtime")
+        lines.append(
+            f"last turn was served by a fallback runtime ({served}), not your primary "
+            f"({primary}) — the primary was unreachable"
+        )
+    elif (not state.prev_on_primary) and cur_on_primary:
+        fallback_transition = True
+        lines.append("back on your primary model runtime")
 
     if snap.gateway is not None and state.prev_gateway_state not in ("", snap.gateway_state):
         lines.append(f"gateway: {state.prev_gateway_state} -> {snap.gateway_state}")
@@ -354,7 +396,8 @@ def _decide_locked(
     for edge in degraded_edges:
         if now - state.bypass_memory.get(edge, -_BYPASS_MEMORY_SECONDS) >= _BYPASS_MEMORY_SECONDS:
             fresh_degradation = True
-    bypass = fresh_degradation or sensor_lost
+    # A fallback transition is a discrete, important event — emit promptly.
+    bypass = fresh_degradation or sensor_lost or fallback_transition
 
     if not bypass and (now - state.last_emit) < min_interval:
         # Suppressed: deliberately do NOT update state, so the change is

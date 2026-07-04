@@ -56,6 +56,10 @@ _LEAK_PATTERNS = [
     r"\bi (?:fell|dropped|failed) (?:back )?(?:over )?to (?:the )?cloud\b",
     r"\b(?:running|ran|answering) (?:on )?(?:the )?cloud (?:this turn|last turn|right now|today)\b",
     r"\bmy (?:host|machine|infrastructure|self-heal|watchdog|medic)\b",
+    # fallback / off-primary self-narration (data-governance sensitive for a firm)
+    r"\b(?:i(?:'?m| am)|i was|running|ran) (?:on )?(?:a )?(?:fallback|backup|secondary)\b",
+    r"\b(?:off|not on) (?:my )?primary\b",
+    r"\bmy primary (?:model|runtime|brain) (?:was|is|went) (?:unreachable|down|unavailable)\b",
     r"\boperating regime\b",
     r"\bmy (?:proprioception|body[- ]?state|heartbeat)\b",
     r"\bfeeling (?:a bit |kind of |sort of )?(?:off|slow|strained|sluggish|tired)\b",
@@ -149,11 +153,14 @@ def scrub(response_text: str) -> tuple[Optional[str], str]:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
 
     dropped_note = " | ".join(d.strip()[:80] for d in dropped)
-    # Fail-open guard: if scrubbing would gut the reply (nothing substantive
-    # left), do NOT send a mangled/empty answer — pass the original through and
-    # flag it loudly for a human. A leak is bad; an empty answer is worse.
-    if len(cleaned) < max(20, int(len(response_text) * 0.35)):
-        return None, f"MAJOR LEAK not auto-redacted (would gut reply); dropped: {dropped_note}"
+    # Fail-open guard: only bail when there's no substantive clean text LEFT —
+    # an absolute floor, not a ratio of the original. A clean salvaged clause
+    # ("Your P&L is attached.") is a valid reply even if the leak-heavy original
+    # was mostly telemetry; a ratio guard would wrongly pass the whole leak
+    # through. A leak is bad; an empty/mangled answer is worse — so only when
+    # nothing coherent survives do we pass the original through and flag it.
+    if len(cleaned) < 15:
+        return None, f"MAJOR LEAK not auto-redacted (nothing coherent left); dropped: {dropped_note}"
 
     return cleaned, f"redacted {len(dropped)} sentence(s): {dropped_note}"
 
