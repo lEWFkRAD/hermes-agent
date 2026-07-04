@@ -520,3 +520,66 @@ def test_cold_start_sensor_miss_is_silent_then_recovers(monkeypatch):
     assert _beat(cfg=cfg) is None  # cold miss: silent
     _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
     assert _beat(cfg=cfg) is not None  # feed coming online IS a transition
+
+
+# ---------------------------------------------------------------------------
+# fallback awareness (consumes core turn-telemetry last_turn record)
+# ---------------------------------------------------------------------------
+
+_ON = {"has_data": True, "was_fallback": False, "provider": "moa",
+       "primary_model": "moa-personal", "primary_provider": "moa"}
+_OFF = {"has_data": True, "was_fallback": True, "provider": "anthropic",
+        "primary_model": "moa-personal", "primary_provider": "moa"}
+
+
+def _beat_lt(session, last_turn, cfg=None):
+    return heartbeat.build_heartbeat(
+        session_id=session, conversation_history=[],
+        settings=cfg or _settings(min_interval_seconds=10_000), last_turn=last_turn)
+
+
+def test_fallback_transition_emits_despite_rate_limit(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f1", _ON) is None                    # on primary, green -> silent
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    beat = _beat_lt("f1", _OFF)                            # fell back -> emits (bypass)
+    assert beat is not None
+    assert "fallback runtime" in beat and "moa-personal" in beat and "anthropic" in beat
+
+
+def test_fallback_not_repeated_while_still_degraded(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    _beat_lt("f2", _ON)
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f2", _OFF) is not None                # transition
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f2", _OFF) is None                    # still off -> no repeat
+
+
+def test_back_on_primary_emits_recovery(monkeypatch):
+    # recovery is announced only if the fallback was announced first:
+    # on-primary baseline -> fell back (emit) -> back on primary (recovery).
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f3", _ON) is None                     # on-primary baseline
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f3", _OFF) is not None                # fell back (announced)
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    beat = _beat_lt("f3", _ON)                             # recovered
+    assert beat is not None and "back on your primary" in beat.lower()
+
+
+def test_empty_last_turn_never_triggers_fallback(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f4", {"has_data": False}) is None
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f4", None) is None
+
+
+def test_session_starting_on_fallback_is_reported_next_turn(monkeypatch):
+    # first turn already off-primary: baseline stays silent about it, but the
+    # next reading reports the True->False transition (not silently normalized).
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat_lt("f5", _OFF) is None                    # baseline, green -> silent
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    beat = _beat_lt("f5", _OFF)
+    assert beat is not None and "fallback runtime" in beat  # caught on turn 2
