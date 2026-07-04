@@ -53,6 +53,7 @@ def _pre_llm_call(**kwargs: Any) -> Optional[dict]:
             session_id=session_id,
             conversation_history=kwargs.get("conversation_history"),
             settings=settings,
+            last_turn=kwargs.get("last_turn"),
         )
         if text:
             # Tell the output firewall a self-signal rode into THIS turn, so it
