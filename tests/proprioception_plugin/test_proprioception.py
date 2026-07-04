@@ -673,3 +673,56 @@ def test_settings_gap_report_seconds_sanitized(monkeypatch):
         lambda: {"proprioception": {"enabled": True, "gap_report_seconds": -50}},
     )
     assert get_settings()["gap_report_seconds"] == 0  # negative floored
+
+
+# ---------------------------------------------------------------------------
+# always-on clock (opt-in temporal grounding)
+# ---------------------------------------------------------------------------
+
+def test_clock_defaults_off_and_stays_silent_when_green(monkeypatch):
+    # zero-regression: with the clock off (default), a green baseline is silent.
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    assert _beat(session="ck0", cfg=_settings()) is None
+
+
+def test_clock_first_turn_shows_time_no_delta(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    beat = _beat(session="ck1", cfg=_settings(clock=True))
+    assert beat is not None
+    assert "clock" in beat and "first turn" in beat
+    assert beat.startswith("<host-telemetry>")
+
+
+def test_clock_emits_every_turn_with_delta_bypassing_rate_limit(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    cfg = _settings(clock=True, min_interval_seconds=10_000)
+    _beat(session="ck2", cfg=cfg)  # first turn (baseline)
+    heartbeat._SESSIONS["ck2"].last_turn_wall = time.time() - 120  # 2 min ago
+    _refetch(monkeypatch, _dashboard_payload({"agg": "ok"}))
+    beat = _beat(session="ck2", cfg=cfg)  # green, no change — only the clock
+    assert beat is not None                                  # forced past the 10k-s floor
+    assert "clock" in beat and "since your last turn" in beat
+
+
+def test_clock_coexists_with_a_real_change(monkeypatch):
+    _install_dashboard(monkeypatch, _dashboard_payload({"vision": "ok"}))
+    cfg = _settings(clock=True)
+    _beat(session="ck3", cfg=cfg)  # baseline
+    _refetch(monkeypatch, _dashboard_payload({"vision": "down"}))
+    beat = _beat(session="ck3", cfg=cfg)
+    assert beat is not None
+    assert "clock" in beat and "label-vision" in beat and "DOWN" in beat
+
+
+def test_clock_config_sanitized_to_bool(monkeypatch):
+    import hermes_cli.config as config_mod
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: {"proprioception": {"enabled": True, "clock": "yes"}},
+    )
+    assert get_settings()["clock"] is True
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: {"proprioception": {"enabled": True}},
+    )
+    assert get_settings()["clock"] is False  # absent -> default off
