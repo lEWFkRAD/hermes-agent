@@ -1045,6 +1045,82 @@ def test_reference_guidance_appended_at_end_in_tool_loop():
     assert len(messages) == 5
 
 
+def _moa_agent(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: review
+  presets:
+    review:
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.5
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return AIAgent(
+        api_key="moa-virtual-provider",
+        base_url="moa://local",
+        model="review",
+        provider="moa",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        enabled_toolsets=["file"],
+        max_iterations=1,
+    )
+
+
+def test_moa_ensure_primary_client_rebuilds_facade_after_none(monkeypatch, tmp_path):
+    """A Noned-out MoA client is rebuilt as a MoAClient facade, not OpenAI().
+
+    Regression for the 2026-07-05 run-killer: soft cache eviction
+    (release_clients) sets agent.client = None mid-session; the generic
+    recreation path then ran OpenAI(**agent._client_kwargs) with the moa
+    provider's intentionally EMPTY kwargs and raised "The api_key client
+    option must be set", deterministically failing all 3 outer retries and
+    aborting the run.
+    """
+    from agent.moa_loop import MoAClient
+
+    agent = _moa_agent(monkeypatch, tmp_path)
+    assert isinstance(agent.client, MoAClient)
+
+    # Simulate soft cache eviction / self-heal teardown.
+    agent.client = None
+
+    rebuilt = agent._ensure_primary_openai_client(reason="chat_completion_stream_request")
+    assert isinstance(rebuilt, MoAClient)
+    assert agent.client is rebuilt
+    # The rebuilt facade carries the init-time reference-display relay.
+    assert rebuilt.chat.completions.reference_callback is agent._moa_reference_relay
+
+
+def test_moa_turn_survives_evicted_client(monkeypatch, tmp_path):
+    """A full MoA turn completes even when the shared client was evicted."""
+    calls = []
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        if kwargs["task"] == "moa_reference":
+            return _response("reference advice")
+        return _response("aggregator acted")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+
+    agent = _moa_agent(monkeypatch, tmp_path)
+    agent.client = None  # evicted between turns
+
+    result = agent.run_conversation("solve this")
+    assert result["final_response"] == "aggregator acted"
+
+
 def test_reference_guidance_merges_into_trailing_user_in_plain_chat():
     """Plain chat ends on the user turn, so the block merges there (still at end)."""
     from agent.moa_loop import _attach_reference_guidance

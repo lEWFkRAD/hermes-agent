@@ -4012,19 +4012,36 @@ class AIAgent:
             if client is not None and not self._is_openai_client_closed(client):
                 return client
             old_client = client
-            try:
-                new_client = self._create_openai_client(
-                    self._client_kwargs, reason=reason, shared=True
+            if self.provider == "moa":
+                # MoA's primary client is the in-process MoAClient facade and
+                # _client_kwargs is intentionally empty for this virtual
+                # provider, so the generic OpenAI(**_client_kwargs) rebuild
+                # below raises "The api_key client option must be set" and
+                # deterministically aborts the run after anything Nones the
+                # shared client mid-session (soft cache eviction, session
+                # self-heal rebuilds). Rebuild the facade instead, rewiring
+                # the init-time reference-display relay when available.
+                from agent.moa_loop import MoAClient
+
+                new_client = MoAClient(
+                    self.model or "default",
+                    reference_callback=getattr(self, "_moa_reference_relay", None),
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to recreate closed OpenAI client (%s) %s error=%s",
-                    reason,
-                    self._client_log_context(),
-                    exc,
-                )
-                raise RuntimeError("Failed to recreate closed OpenAI client") from exc
-            self.client = new_client
+                self.client = new_client
+            else:
+                try:
+                    new_client = self._create_openai_client(
+                        self._client_kwargs, reason=reason, shared=True
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to recreate closed OpenAI client (%s) %s error=%s",
+                        reason,
+                        self._client_log_context(),
+                        exc,
+                    )
+                    raise RuntimeError("Failed to recreate closed OpenAI client") from exc
+                self.client = new_client
 
         logger.warning(
             "Detected closed shared OpenAI client; recreated before use (%s) %s",
