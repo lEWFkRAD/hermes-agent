@@ -1338,6 +1338,32 @@ def run_conversation(
             except Exception as _moa_exc:
                 logger.warning("MoA context aggregation failed: %s", _moa_exc)
 
+        # AMDP planning layer (opt-in, default OFF via the `amdp:` config block).
+        # Mirrors the MoA injection above: run one planning episode and append the
+        # chosen course of action to the tail user message, ephemerally (kept out
+        # of persistent history, so the KV-cache penalty stays at the tail).
+        # maybe_amdp_context owns all gating (disabled / not dispatch-worthy /
+        # blind state) and is fail-closed — it returns "" and never raises, so a
+        # disabled or misbehaving planner cannot alter or break the turn.
+        try:
+            from agent.amdp.loop import maybe_amdp_context
+            from hermes_cli.config import load_config
+
+            _amdp_context = maybe_amdp_context(
+                original_user_message if isinstance(original_user_message, str) else str(original_user_message),
+                api_messages,
+                load_config(),
+            )
+            if _amdp_context:
+                for _msg in reversed(api_messages):
+                    if _msg.get("role") == "user":
+                        _base = _msg.get("content", "")
+                        if isinstance(_base, str):
+                            _msg["content"] = _base + "\n\n" + _amdp_context
+                        break
+        except Exception as _amdp_exc:
+            logger.warning("AMDP planning failed: %s", _amdp_exc)
+
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
         if agent.prefill_messages:
