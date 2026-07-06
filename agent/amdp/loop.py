@@ -9,6 +9,10 @@ proprioception collector's snapshot instead of raw HTTP.
 It is fail-closed: it returns ``""`` (inject nothing, proceed normally) on a
 disabled config, a turn that doesn't clear the gate, blind/stale state, or ANY
 exception. It never raises into the turn.
+
+Misconfiguration is fail-LOUD, not fail-silent: an ``enabled: true`` block with
+an empty planner/reviewer is resolved once (cached) and logged at ERROR, and
+AMDP stays disabled — it does NOT silently no-op every turn while looking fine.
 """
 
 from __future__ import annotations
@@ -17,29 +21,62 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from agent.amdp import prompts, schemas, scoring
-from agent.amdp.config import AmdpConfig, resolve_amdp_config
+from agent.amdp.config import AmdpConfig, AmdpConfigError, resolve_amdp_config
 
 logger = logging.getLogger(__name__)
 
 _MAX_REVIEW_WORKERS = 8
+_AUDIT_LOCK = threading.Lock()
+
+# Per-call timeout for the current episode, set from cfg.call_timeout_s at the
+# top of maybe_amdp_context. A module global (not a _call kwarg) so the test
+# suite's mock _call signature stays stable; concurrent episodes use a similar
+# value so the benign race is harmless.
+_active_call_timeout: float = 90.0
+
+# Startup-resolved config cache. Resolved ONCE (first turn on the hook path),
+# then reused, so the disabled/absent path costs a cheap identity check instead
+# of a fresh load_config() + deepcopy every turn. Config changes need a restart
+# (consistent with the ConfigSentinel/golden workflow).
+_UNSET = object()
+_cached_cfg: Any = _UNSET
+_cached_raw: dict[str, Any] = {}
 
 
 # --------------------------------------------------------------------------- #
 # Model plumbing (real infra)
 # --------------------------------------------------------------------------- #
 def _extract_text(response: Any) -> str:
-    """Assistant text with the gpt-oss reasoning_content fallback."""
+    """Assistant text with the gpt-oss reasoning_content fallback.
+
+    Handles both a plain dict message (some transports / tests) and the OpenAI
+    SDK ``ChatCompletionMessage`` (a pydantic model), where provider-extension
+    fields like ``reasoning_content`` arrive in ``message.model_extra`` rather
+    than as a declared attribute. Missing that path silently blinded the
+    reviewer on reasoning-only models."""
     try:
         message = response.choices[0].message
     except (AttributeError, IndexError, TypeError):
         return ""
+    if isinstance(message, dict):
+        for field in ("content", "reasoning_content", "reasoning"):
+            val = message.get(field)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+    extra = getattr(message, "model_extra", None)
+    if not isinstance(extra, dict):
+        extra = {}
     for field in ("content", "reasoning_content", "reasoning"):
-        val = message.get(field) if isinstance(message, dict) else getattr(message, field, None)
+        val = getattr(message, field, None)
+        if not (isinstance(val, str) and val.strip()):
+            val = extra.get(field)
         if isinstance(val, str) and val.strip():
             return val.strip()
     return ""
@@ -53,7 +90,9 @@ def _call(
     max_tokens: int | None,
     json_mode: bool = False,
 ) -> tuple[str, str]:
-    """One model call through call_llm. Returns (text, error). Never raises."""
+    """One model call through call_llm. Returns (text, error). Never raises.
+    Bounded by the per-episode ``_active_call_timeout`` so a flapping local
+    endpoint cannot stall the turn indefinitely."""
     try:
         from agent.auxiliary_client import call_llm
         from agent.moa_loop import _slot_runtime
@@ -66,6 +105,7 @@ def _call(
             temperature=temperature,
             max_tokens=max_tokens,
             extra_body=extra_body,
+            timeout=_active_call_timeout,
             **runtime,
         )
         return _extract_text(response), ""
@@ -88,21 +128,33 @@ def _proprioception_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _intake(config: dict[str, Any]) -> dict[str, Any]:
-    """Return {brief, sensors_down, staleness_s} from the live snapshot. Never
-    raises; on failure reports every sensor down so the gate refuses."""
+    """Return {brief, sensors_down, staleness_s, ...} from the live snapshot.
+    Never raises; on failure reports a sensor down so the gate refuses."""
     try:
         from plugins.proprioception.collector import ATTENTION_STATES, get_snapshot
 
         settings = _proprioception_settings(config)
-        snap = get_snapshot(settings, force=True)
+        # force=False: honor the collector's 30s TTL and shared-cache design so
+        # AMDP doesn't force a blocking dashboard fetch and evict the heartbeat's
+        # cache on every qualifying turn.
+        snap = get_snapshot(settings, force=False)
         systems = (snap.dashboard or {}).get("systems") or []
         attention = [
             s for s in systems if isinstance(s, dict) and str(s.get("state")) in ATTENTION_STATES
         ]
         verdict = "attention" if attention else ("ok" if snap.dashboard is not None else "unknown")
+
+        sensors_down = list(snap.sensors_down)
+        # An intentionally-unconfigured dashboard (empty dashboard_url, the
+        # default since the dashboard was made optional) is an ABSENT optional
+        # sensor, not a failed one — don't refuse to plan just because no
+        # dashboard URL is set. Only a real fetch failure counts as down.
+        if getattr(snap, "dashboard_error", "") == "not configured" and "dashboard" in sensors_down:
+            sensors_down.remove("dashboard")
+
         lines = [f"overall verdict: {verdict}", f"gateway: {snap.gateway_state}"]
-        if snap.sensors_down:
-            lines.append(f"sensors DOWN: {', '.join(snap.sensors_down)}")
+        if sensors_down:
+            lines.append(f"sensors DOWN: {', '.join(sensors_down)}")
         if snap.dashboard_stale_for:
             lines.append(f"state staleness: {snap.dashboard_stale_for:.0f}s")
         if attention:
@@ -113,7 +165,7 @@ def _intake(config: dict[str, Any]) -> dict[str, Any]:
             lines.append(f"all {len(systems)} monitored systems calm")
         return {
             "brief": "\n".join(lines),
-            "sensors_down": list(snap.sensors_down),
+            "sensors_down": sensors_down,
             "staleness_s": float(snap.dashboard_stale_for or 0.0),
             "verdict": verdict,
             "gateway_state": snap.gateway_state,
@@ -136,17 +188,20 @@ def _should_refuse(state: dict[str, Any], *, staleness_max_s: float) -> tuple[bo
 # --------------------------------------------------------------------------- #
 # Gate — is this turn dispatch-worthy? (cheap heuristic, no model call)
 # --------------------------------------------------------------------------- #
+# Deliberately excludes bare "then"/"first" — they fire on ordinary conversation
+# ("first, thanks; then...") and would tax a chat turn with a 30-60s planning
+# episode. Keep multi-word / task-shaped markers only.
 _MULTISTEP_HINTS = re.compile(
-    r"\b(migrate|refactor|pipeline|deploy|and then|then\b|after that|first\b|"
-    r"step\s*\d|each of|all of|for every|for each|end[- ]to[- ]end|multi[- ]step)\b",
+    r"\b(migrate|refactor|pipeline|deploy|and then|after that|step\s*\d|each of|"
+    r"all of|for every|for each|end[- ]to[- ]end|multi[- ]step)\b",
     re.IGNORECASE,
 )
 
 
-def _estimate_steps(user_prompt: str, api_messages: list[dict[str, Any]]) -> int:
+def _estimate_steps(user_prompt: Any, api_messages: list[dict[str, Any]]) -> int:
     """Very cheap dispatch-worthiness estimate. Don't spend a model call deciding
     whether to spend model calls."""
-    text = user_prompt or ""
+    text = user_prompt if isinstance(user_prompt, str) else ""
     score = 0
     score += len(_MULTISTEP_HINTS.findall(text))
     score += text.count("\n- ") + text.count("\n1.") + text.count("\n2.")  # list items
@@ -164,26 +219,38 @@ def _estimate_steps(user_prompt: str, api_messages: list[dict[str, Any]]) -> int
 def _generate_coas(cfg: AmdpConfig, intent: str, state_brief: str, errors: list[str]) -> list[dict[str, Any]]:
     msgs = prompts.commander_prompt(intent, state_brief, cfg.n_coas)
     text, err = _call(cfg.planner, msgs, temperature=0.4, max_tokens=3500, json_mode=True)
-    if not text:
+    coas: list[dict[str, Any]] | None = None
+    if text:
+        try:
+            coas = schemas.coerce_coas(schemas.extract_json(text))
+        except ValueError as exc:
+            errors.append(f"COA parse failed ({exc}); retrying")
+    else:
         errors.append(f"commander failed: {err or 'empty'}")
-        return []
-    try:
-        return schemas.coerce_coas(schemas.extract_json(text))
-    except ValueError as exc:
-        errors.append(f"COA parse failed ({exc}); retrying")
-    repair = msgs + [
-        {"role": "assistant", "content": text[:2000]},
-        {"role": "user", "content": "Return ONLY the JSON object with a top-level 'coas' array. No prose."},
-    ]
-    text2, err2 = _call(cfg.planner, repair, temperature=0.1, max_tokens=3500, json_mode=True)
-    if not text2:
-        errors.append(f"commander repair failed: {err2 or 'empty'}")
-        return []
-    try:
-        return schemas.coerce_coas(schemas.extract_json(text2))
-    except ValueError as exc:
-        errors.append(f"COA parse failed after repair: {exc}")
-        return []
+
+    if coas is None:
+        # Repair WITHOUT json_mode (prompt-only): if the endpoint rejected
+        # response_format, or emitted prose, extract_json can still recover.
+        repair = msgs + [
+            {"role": "assistant", "content": (text or "")[:2000]},
+            {"role": "user", "content": "Return ONLY the JSON object with a top-level 'coas' array. No prose, no fences."},
+        ]
+        text2, err2 = _call(cfg.planner, repair, temperature=0.1, max_tokens=3500, json_mode=False)
+        if not text2:
+            errors.append(f"commander repair failed: {err2 or 'empty'}")
+            return []
+        try:
+            coas = schemas.coerce_coas(schemas.extract_json(text2))
+        except ValueError as exc:
+            errors.append(f"COA parse failed after repair: {exc}")
+            return []
+
+    # Force unique coa_ids regardless of what the model labeled them, so two
+    # COAs sharing an id can't collapse in _decide's review-by-id map and pin
+    # the wrong review to a plan.
+    for i, coa in enumerate(coas):
+        coa["coa_id"] = chr(ord("A") + i) if i < 26 else f"C{i}"
+    return coas
 
 
 def _review_one(cfg: AmdpConfig, intent: str, state_brief: str, coa: dict[str, Any]) -> dict[str, Any]:
@@ -231,7 +298,7 @@ def _decide(cfg: AmdpConfig, coas: list[dict[str, Any]], reviews: list[dict[str,
             for name in scoring.PROFILES
         }
         scored.append({"coa": coa, "review": review, "scores": by_profile})
-    prof = cfg.decision_profile
+    prof = cfg.decision_profile if cfg.decision_profile in scoring.PROFILES else scoring.DEFAULT_PROFILE
     best = max(scored, key=lambda s: (s["scores"][prof]["score"], -len(s["coa"]["dispatches"])))
     return best, scored
 
@@ -248,8 +315,12 @@ def _append_audit(cfg: AmdpConfig, record: dict[str, Any]) -> None:
     try:
         path = _audit_path(cfg)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        # Serialize writes across the gateway's concurrent sessions so large
+        # multi-KB records can't interleave into a corrupt JSONL line.
+        with _AUDIT_LOCK:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
     except Exception as exc:  # audit must never break a turn
         logger.debug("AMDP audit write failed: %s", exc)
 
@@ -257,14 +328,19 @@ def _append_audit(cfg: AmdpConfig, record: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # Plan rendering + entry point
 # --------------------------------------------------------------------------- #
-def _render_plan(best: dict[str, Any], cfg: AmdpConfig) -> str:
+def _render_plan(best: dict[str, Any], cfg: AmdpConfig, unvetted: bool = False) -> str:
     coa, review = best["coa"], best["review"]
     lines = [
         "[AMDP plan — private guidance for the agent loop. You may follow it, adapt it, "
         "or finish normally; you own tool calling and turn termination.]",
-        f"Chosen course of action ({coa['coa_id']}): {coa['summary']}",
-        "Dispatches:",
     ]
+    if unvetted:
+        lines.append(
+            "WARNING: war-gaming unavailable — the reviewer could not be reached, so this "
+            "plan was NOT risk-reviewed. Treat it as an unvetted draft and be extra careful."
+        )
+    lines.append(f"Chosen course of action ({coa['coa_id']}): {coa['summary']}")
+    lines.append("Dispatches:")
     for i, d in enumerate(coa["dispatches"], 1):
         flag = " [IRREVERSIBLE — confirm before acting]" if d.get("irreversible") else ""
         crit = f" success: {'; '.join(d['success_criteria'])}" if d.get("success_criteria") else ""
@@ -277,29 +353,76 @@ def _render_plan(best: dict[str, Any], cfg: AmdpConfig) -> str:
     return "\n".join(lines)
 
 
+def _get_cached() -> tuple[Any, dict[str, Any]]:
+    """Resolve the active AMDP config ONCE (hook path), fail-loud on misconfig,
+    and cache so the disabled/absent path is a cheap check thereafter."""
+    global _cached_cfg, _cached_raw
+    if _cached_cfg is not _UNSET:
+        return _cached_cfg, _cached_raw
+    raw: dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config
+
+        raw = load_config() or {}
+    except Exception as exc:
+        logger.warning("AMDP config load failed; planning disabled: %s", exc)
+        _cached_cfg, _cached_raw = None, {}
+        return _cached_cfg, _cached_raw
+    try:
+        _cached_cfg = resolve_amdp_config(raw)
+    except AmdpConfigError as exc:
+        logger.error("AMDP MISCONFIGURED — planning disabled (fix config and restart): %s", exc)
+        _cached_cfg = None
+    _cached_raw = raw
+    if _cached_cfg is not None:
+        logger.info("AMDP enabled: planner=%s reviewer=%s profile=%s",
+                    _cached_cfg.planner, _cached_cfg.reviewer, _cached_cfg.decision_profile)
+    return _cached_cfg, _cached_raw
+
+
+def reset_cache_for_tests() -> None:
+    global _cached_cfg, _cached_raw
+    _cached_cfg, _cached_raw = _UNSET, {}
+
+
 def maybe_amdp_context(
     user_prompt: str,
     api_messages: list[dict[str, Any]],
-    config: dict[str, Any] | None,
+    config: dict[str, Any] | None = None,
 ) -> str:
     """The single entry point. Returns an injectable plan block, or "" to inject
-    nothing and let the agent proceed normally. Fail-closed."""
+    nothing and let the agent proceed normally. Fail-closed against crashes,
+    fail-LOUD against misconfiguration."""
     t0 = time.monotonic()
     try:
-        cfg = resolve_amdp_config(config)
+        # Resolve config. An explicit config (tests / callers) resolves fresh and
+        # surfaces AmdpConfigError LOUDLY; None uses the cached startup resolve.
+        if config is not None:
+            try:
+                cfg = resolve_amdp_config(config)
+            except AmdpConfigError as exc:
+                logger.error("AMDP MISCONFIGURED — planning disabled: %s", exc)
+                return ""
+            raw_config: dict[str, Any] = config
+        else:
+            cfg, raw_config = _get_cached()
         if cfg is None:
-            return ""  # AMDP absent/disabled
+            return ""
+
+        global _active_call_timeout
+        _active_call_timeout = cfg.call_timeout_s
 
         est = _estimate_steps(user_prompt, api_messages)
         if est < cfg.min_estimated_steps:
             return ""  # not dispatch-worthy; don't spend model calls
 
-        state = _intake(config or {})
+        state = _intake(raw_config or {})
         refuse, reason = _should_refuse(state, staleness_max_s=cfg.staleness_max_s)
         if refuse:
             _append_audit(cfg, {
-                "ts": time.time(), "intent": user_prompt[:2000], "refused": True,
-                "refuse_reason": reason, "believed_state": {k: state[k] for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
+                "ts": time.time(), "intent": str(user_prompt)[:2000], "refused": True,
+                "refuse_reason": reason,
+                "believed_state": {k: state.get(k) for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
             })
             logger.info("AMDP refused to plan: %s", reason)
             return ""
@@ -307,22 +430,30 @@ def maybe_amdp_context(
         errors: list[str] = []
         coas = _generate_coas(cfg, user_prompt, state["brief"], errors)
         if not coas:
-            _append_audit(cfg, {"ts": time.time(), "intent": user_prompt[:2000], "coas": 0, "errors": errors})
+            _append_audit(cfg, {"ts": time.time(), "intent": str(user_prompt)[:2000], "coas": 0, "errors": errors})
             return ""
+
+        if time.monotonic() - t0 > cfg.episode_deadline_s:
+            _append_audit(cfg, {"ts": time.time(), "intent": str(user_prompt)[:2000], "coas": len(coas),
+                                "aborted": "episode deadline exceeded before war-gaming", "errors": errors})
+            logger.info("AMDP aborted: episode deadline exceeded")
+            return ""
+
         reviews = _review_all(cfg, user_prompt, state["brief"], coas)
         staleness_norm = min(1.0, state["staleness_s"] / cfg.staleness_max_s) if cfg.staleness_max_s else 0.0
         best, scored = _decide(cfg, coas, reviews, staleness_norm)
+        unvetted = bool(reviews) and all(r.get("_review_failed") for r in reviews)
 
         _append_audit(cfg, {
-            "ts": time.time(), "intent": user_prompt[:2000], "refused": False,
-            "decision_profile": cfg.decision_profile, "estimated_steps": est,
-            "believed_state": {k: state[k] for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
+            "ts": time.time(), "intent": str(user_prompt)[:2000], "refused": False,
+            "decision_profile": cfg.decision_profile, "estimated_steps": est, "unvetted": unvetted,
+            "believed_state": {k: state.get(k) for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
             "coas": coas, "reviews": reviews,
             "scores": [{"coa_id": s["coa"]["coa_id"], "by_profile": s["scores"]} for s in scored],
             "chosen": best["coa"]["coa_id"], "errors": errors,
             "elapsed_s": round(time.monotonic() - t0, 2),
         })
-        return _render_plan(best, cfg)
+        return _render_plan(best, cfg, unvetted=unvetted)
     except Exception as exc:  # fail-closed: never break the turn
         logger.warning("AMDP planning failed, proceeding without a plan: %s", exc)
         return ""

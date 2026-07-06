@@ -1347,12 +1347,13 @@ def run_conversation(
         # disabled or misbehaving planner cannot alter or break the turn.
         try:
             from agent.amdp.loop import maybe_amdp_context
-            from hermes_cli.config import load_config
 
+            # config omitted: maybe_amdp_context resolves + caches the amdp block
+            # once (fail-loud on misconfig) so the disabled/absent path is a cheap
+            # check, not a fresh load_config() deepcopy every turn.
             _amdp_context = maybe_amdp_context(
                 original_user_message if isinstance(original_user_message, str) else str(original_user_message),
                 api_messages,
-                load_config(),
             )
             if _amdp_context:
                 for _msg in reversed(api_messages):

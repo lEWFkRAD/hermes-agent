@@ -22,8 +22,11 @@ disabled or absent block returns ``None`` and the caller treats AMDP as off.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class AmdpConfigError(ValueError):
@@ -43,14 +46,21 @@ class AmdpConfig:
     hitl_gate_irreversible: bool = True
     decision_profile: str = "v1_balanced"
     reviewer_max_tokens: int | None = 1800
+    call_timeout_s: float = 90.0
+    episode_deadline_s: float = 240.0
     raw: dict[str, Any] = field(default_factory=dict)
 
 
 def _valid_slot(slot: Any) -> bool:
+    """A slot is valid only if provider AND model are non-blank STRINGS. A YAML
+    list/int/dict for provider must be rejected, not stringified — otherwise a
+    garbage provider ('[a, b]') sails through and fails opaquely downstream."""
+    if not isinstance(slot, dict):
+        return False
+    provider, model = slot.get("provider"), slot.get("model")
     return (
-        isinstance(slot, dict)
-        and bool(str(slot.get("provider") or "").strip())
-        and bool(str(slot.get("model") or "").strip())
+        isinstance(provider, str) and bool(provider.strip())
+        and isinstance(model, str) and bool(model.strip())
     )
 
 
@@ -91,10 +101,34 @@ def resolve_amdp_config(config: dict[str, Any] | None) -> AmdpConfig | None:
         staleness = float(block.get("staleness_max_s", 120))
     except (TypeError, ValueError):
         staleness = 120.0
+    try:
+        call_timeout_s = float(block.get("call_timeout_s", 90))
+    except (TypeError, ValueError):
+        call_timeout_s = 90.0
+    try:
+        episode_deadline_s = float(block.get("episode_deadline_s", 240))
+    except (TypeError, ValueError):
+        episode_deadline_s = 240.0
+
+    # decision_profile must name a real scoring profile, else _decide would
+    # KeyError on every turn (a typo like 'balanced' would silently disable
+    # planning after paying for all the model calls). Fall back with a warning.
+    from agent.amdp import scoring
+
     profile = str(block.get("decision_profile") or "v1_balanced")
+    if profile not in scoring.PROFILES:
+        logger.warning(
+            "amdp.decision_profile %r is not a known profile %s; using v1_balanced",
+            profile, sorted(scoring.PROFILES),
+        )
+        profile = "v1_balanced"
 
     rmt = block.get("reviewer_max_tokens", 1800)
-    reviewer_max_tokens = None if rmt in (None, 0, "", "none") else int(rmt)
+    try:
+        reviewer_max_tokens = None if rmt in (None, 0, "", "none") else int(rmt)
+    except (TypeError, ValueError):
+        logger.warning("amdp.reviewer_max_tokens %r invalid; using 1800", rmt)
+        reviewer_max_tokens = 1800
 
     return AmdpConfig(
         enabled=True,
@@ -107,5 +141,7 @@ def resolve_amdp_config(config: dict[str, Any] | None) -> AmdpConfig | None:
         hitl_gate_irreversible=bool(block.get("hitl_gate_irreversible", True)),
         decision_profile=profile,
         reviewer_max_tokens=reviewer_max_tokens,
+        call_timeout_s=call_timeout_s,
+        episode_deadline_s=episode_deadline_s,
         raw=block,
     )
