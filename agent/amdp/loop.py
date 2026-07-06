@@ -17,12 +17,14 @@ AMDP stays disabled — it does NOT silently no-op every turn while looking fine
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -47,6 +49,47 @@ _active_call_timeout: float = 90.0
 _UNSET = object()
 _cached_cfg: Any = _UNSET
 _cached_raw: dict[str, Any] = {}
+
+# Per-user-turn plan cache. The conversation loop calls the hook on EVERY
+# tool-loop iteration; without this, AMDP re-plans (a full ~40s episode) on each
+# one. We plan ONCE per user turn and re-inject the cached result on subsequent
+# iterations with zero model calls — same idea as MoA's user_turn fan-out. Keyed
+# by a hash of the original user prompt + the conversation prefix up to the last
+# user message (stable across a turn's tool iterations, changes on a new turn).
+# Bounded; oldest entry dropped. A cached value of "" (a gate-skip or refusal) is
+# distinct from a cache miss (None from .get).
+_PLAN_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_PLAN_CACHE_MAX = 64
+_PLAN_CACHE_LOCK = threading.Lock()
+
+
+def _turn_signature(user_prompt: Any, api_messages: list[dict[str, Any]]) -> str:
+    h = hashlib.sha256()
+    h.update(("PROMPT\x00" + str(user_prompt)).encode("utf-8", "replace"))
+    last_user = -1
+    for i, m in enumerate(api_messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user = i
+    prefix = api_messages[: last_user + 1] if last_user >= 0 else api_messages
+    for m in prefix:
+        if isinstance(m, dict):
+            c = m.get("content")
+            c = c if isinstance(c, str) else json.dumps(c, default=str, ensure_ascii=False)
+            h.update(f"\x00{m.get('role')}\x00{c}".encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def _cache_get(sig: str) -> str | None:
+    with _PLAN_CACHE_LOCK:
+        return _PLAN_CACHE.get(sig)
+
+
+def _cache_put(sig: str, val: str) -> None:
+    with _PLAN_CACHE_LOCK:
+        _PLAN_CACHE[sig] = val
+        _PLAN_CACHE.move_to_end(sig)
+        while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
+            _PLAN_CACHE.popitem(last=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -127,45 +170,50 @@ def _proprioception_settings(config: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _intake(config: dict[str, Any]) -> dict[str, Any]:
+def _intake(config: dict[str, Any], timeout_s: float | None = None) -> dict[str, Any]:
     """Return {brief, sensors_down, staleness_s, ...} from the live snapshot.
-    Never raises; on failure reports a sensor down so the gate refuses."""
+    Never raises. The dashboard is OPTIONAL enrichment — a down/slow dashboard
+    is recorded but does NOT block planning; only a missing gateway status
+    (``gateway-status`` in sensors_down) means we're truly blind."""
     try:
         from plugins.proprioception.collector import ATTENTION_STATES, get_snapshot
 
         settings = _proprioception_settings(config)
-        # force=False: honor the collector's 30s TTL and shared-cache design so
-        # AMDP doesn't force a blocking dashboard fetch and evict the heartbeat's
-        # cache on every qualifying turn.
+        # A merely-slow dashboard shouldn't cause a refusal — give the fetch a
+        # larger budget than the heartbeat's default so AMDP can read it under
+        # load (the ops dashboard can respond in ~3s on a busy box).
+        if timeout_s:
+            settings = {**settings, "timeout_seconds": float(timeout_s)}
+        # force=False: honor the collector's 30s TTL and shared-cache design.
         snap = get_snapshot(settings, force=False)
         systems = (snap.dashboard or {}).get("systems") or []
         attention = [
             s for s in systems if isinstance(s, dict) and str(s.get("state")) in ATTENTION_STATES
         ]
-        verdict = "attention" if attention else ("ok" if snap.dashboard is not None else "unknown")
+        dashboard_up = snap.dashboard is not None
+        verdict = "attention" if attention else ("ok" if dashboard_up else "unknown")
 
-        sensors_down = list(snap.sensors_down)
-        # An intentionally-unconfigured dashboard (empty dashboard_url, the
-        # default since the dashboard was made optional) is an ABSENT optional
-        # sensor, not a failed one — don't refuse to plan just because no
-        # dashboard URL is set. Only a real fetch failure counts as down.
-        if getattr(snap, "dashboard_error", "") == "not configured" and "dashboard" in sensors_down:
-            sensors_down.remove("dashboard")
+        # Report what's down for the audit/brief, but the dashboard being down
+        # is enrichment-absent, not blindness. Keep only the truly-blinding
+        # sensor (gateway-status) in the refuse-triggering set.
+        raw_down = list(snap.sensors_down)
+        blinding = ["gateway-status"] if "gateway-status" in raw_down else []
 
         lines = [f"overall verdict: {verdict}", f"gateway: {snap.gateway_state}"]
-        if sensors_down:
-            lines.append(f"sensors DOWN: {', '.join(sensors_down)}")
+        if not dashboard_up:
+            lines.append("system dashboard unavailable — planning on gateway status alone")
         if snap.dashboard_stale_for:
             lines.append(f"state staleness: {snap.dashboard_stale_for:.0f}s")
         if attention:
             lines.append("systems needing attention:")
             for s in attention[:12]:
                 lines.append(f"  - {s.get('label', s.get('id', '?'))}: {s.get('state')} ({s.get('detail', '')})")
-        else:
+        elif dashboard_up:
             lines.append(f"all {len(systems)} monitored systems calm")
         return {
             "brief": "\n".join(lines),
-            "sensors_down": sensors_down,
+            "sensors_down": blinding,          # only truly-blinding sensors gate planning
+            "dashboard_up": dashboard_up,      # informational
             "staleness_s": float(snap.dashboard_stale_for or 0.0),
             "verdict": verdict,
             "gateway_state": snap.gateway_state,
@@ -173,13 +221,16 @@ def _intake(config: dict[str, Any]) -> dict[str, Any]:
         }
     except Exception as exc:
         logger.warning("AMDP state intake failed: %s", exc)
-        return {"brief": "", "sensors_down": ["intake-failed"], "staleness_s": 0.0,
-                "verdict": "unknown", "gateway_state": "unknown", "system_count": 0}
+        # A total intake failure IS blinding — no state at all.
+        return {"brief": "", "sensors_down": ["gateway-status"], "staleness_s": 0.0,
+                "verdict": "unknown", "gateway_state": "unknown", "system_count": 0, "dashboard_up": False}
 
 
 def _should_refuse(state: dict[str, Any], *, staleness_max_s: float) -> tuple[bool, str]:
-    if state.get("sensors_down"):
-        return True, f"sensors down: {', '.join(state['sensors_down'])}"
+    # Refuse only when truly blind (no gateway status) or the state is stale —
+    # NOT when only the optional dashboard is unavailable.
+    if "gateway-status" in state.get("sensors_down", []):
+        return True, "gateway status unavailable (no usable state)"
     if state.get("staleness_s", 0) > staleness_max_s:
         return True, f"state staleness {state['staleness_s']:.0f}s exceeds max {staleness_max_s:.0f}s"
     return False, ""
@@ -383,6 +434,8 @@ def _get_cached() -> tuple[Any, dict[str, Any]]:
 def reset_cache_for_tests() -> None:
     global _cached_cfg, _cached_raw
     _cached_cfg, _cached_raw = _UNSET, {}
+    with _PLAN_CACHE_LOCK:
+        _PLAN_CACHE.clear()
 
 
 def maybe_amdp_context(
@@ -391,9 +444,9 @@ def maybe_amdp_context(
     config: dict[str, Any] | None = None,
 ) -> str:
     """The single entry point. Returns an injectable plan block, or "" to inject
-    nothing and let the agent proceed normally. Fail-closed against crashes,
-    fail-LOUD against misconfiguration."""
-    t0 = time.monotonic()
+    nothing. Plans at most ONCE per user turn — subsequent tool-loop iterations
+    of the same turn return the cached result (zero model calls). Fail-closed
+    against crashes, fail-LOUD against misconfiguration."""
     try:
         # Resolve config. An explicit config (tests / callers) resolves fresh and
         # surfaces AmdpConfigError LOUDLY; None uses the cached startup resolve.
@@ -409,51 +462,72 @@ def maybe_amdp_context(
         if cfg is None:
             return ""
 
-        global _active_call_timeout
-        _active_call_timeout = cfg.call_timeout_s
+        # Once-per-user-turn: reuse the cached outcome across a turn's tool-loop
+        # iterations. A hit returns the same plan (or "") with no model calls.
+        sig = _turn_signature(user_prompt, api_messages)
+        cached = _cache_get(sig)
+        if cached is not None:
+            return cached
 
-        est = _estimate_steps(user_prompt, api_messages)
-        if est < cfg.min_estimated_steps:
-            return ""  # not dispatch-worthy; don't spend model calls
-
-        state = _intake(raw_config or {})
-        refuse, reason = _should_refuse(state, staleness_max_s=cfg.staleness_max_s)
-        if refuse:
-            _append_audit(cfg, {
-                "ts": time.time(), "intent": str(user_prompt)[:2000], "refused": True,
-                "refuse_reason": reason,
-                "believed_state": {k: state.get(k) for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
-            })
-            logger.info("AMDP refused to plan: %s", reason)
-            return ""
-
-        errors: list[str] = []
-        coas = _generate_coas(cfg, user_prompt, state["brief"], errors)
-        if not coas:
-            _append_audit(cfg, {"ts": time.time(), "intent": str(user_prompt)[:2000], "coas": 0, "errors": errors})
-            return ""
-
-        if time.monotonic() - t0 > cfg.episode_deadline_s:
-            _append_audit(cfg, {"ts": time.time(), "intent": str(user_prompt)[:2000], "coas": len(coas),
-                                "aborted": "episode deadline exceeded before war-gaming", "errors": errors})
-            logger.info("AMDP aborted: episode deadline exceeded")
-            return ""
-
-        reviews = _review_all(cfg, user_prompt, state["brief"], coas)
-        staleness_norm = min(1.0, state["staleness_s"] / cfg.staleness_max_s) if cfg.staleness_max_s else 0.0
-        best, scored = _decide(cfg, coas, reviews, staleness_norm)
-        unvetted = bool(reviews) and all(r.get("_review_failed") for r in reviews)
-
-        _append_audit(cfg, {
-            "ts": time.time(), "intent": str(user_prompt)[:2000], "refused": False,
-            "decision_profile": cfg.decision_profile, "estimated_steps": est, "unvetted": unvetted,
-            "believed_state": {k: state.get(k) for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
-            "coas": coas, "reviews": reviews,
-            "scores": [{"coa_id": s["coa"]["coa_id"], "by_profile": s["scores"]} for s in scored],
-            "chosen": best["coa"]["coa_id"], "errors": errors,
-            "elapsed_s": round(time.monotonic() - t0, 2),
-        })
-        return _render_plan(best, cfg, unvetted=unvetted)
+        result = _plan_turn(cfg, raw_config, user_prompt, api_messages)
+        _cache_put(sig, result)
+        return result
     except Exception as exc:  # fail-closed: never break the turn
         logger.warning("AMDP planning failed, proceeding without a plan: %s", exc)
         return ""
+
+
+def _plan_turn(
+    cfg: AmdpConfig,
+    raw_config: dict[str, Any],
+    user_prompt: str,
+    api_messages: list[dict[str, Any]],
+) -> str:
+    """Run one AMDP episode for a fresh user turn. Returns the plan block or "".
+    Wrapped by maybe_amdp_context's cache + top-level fail-closed guard."""
+    t0 = time.monotonic()
+    global _active_call_timeout
+    _active_call_timeout = cfg.call_timeout_s
+
+    est = _estimate_steps(user_prompt, api_messages)
+    if est < cfg.min_estimated_steps:
+        return ""  # not dispatch-worthy; don't spend model calls
+
+    state = _intake(raw_config or {}, timeout_s=cfg.intake_timeout_s)
+    refuse, reason = _should_refuse(state, staleness_max_s=cfg.staleness_max_s)
+    if refuse:
+        _append_audit(cfg, {
+            "ts": time.time(), "intent": str(user_prompt)[:2000], "refused": True,
+            "refuse_reason": reason,
+            "believed_state": {k: state.get(k) for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
+        })
+        logger.info("AMDP refused to plan: %s", reason)
+        return ""
+
+    errors: list[str] = []
+    coas = _generate_coas(cfg, user_prompt, state["brief"], errors)
+    if not coas:
+        _append_audit(cfg, {"ts": time.time(), "intent": str(user_prompt)[:2000], "coas": 0, "errors": errors})
+        return ""
+
+    if time.monotonic() - t0 > cfg.episode_deadline_s:
+        _append_audit(cfg, {"ts": time.time(), "intent": str(user_prompt)[:2000], "coas": len(coas),
+                            "aborted": "episode deadline exceeded before war-gaming", "errors": errors})
+        logger.info("AMDP aborted: episode deadline exceeded")
+        return ""
+
+    reviews = _review_all(cfg, user_prompt, state["brief"], coas)
+    staleness_norm = min(1.0, state["staleness_s"] / cfg.staleness_max_s) if cfg.staleness_max_s else 0.0
+    best, scored = _decide(cfg, coas, reviews, staleness_norm)
+    unvetted = bool(reviews) and all(r.get("_review_failed") for r in reviews)
+
+    _append_audit(cfg, {
+        "ts": time.time(), "intent": str(user_prompt)[:2000], "refused": False,
+        "decision_profile": cfg.decision_profile, "estimated_steps": est, "unvetted": unvetted,
+        "believed_state": {k: state.get(k) for k in ("verdict", "gateway_state", "sensors_down", "staleness_s", "system_count")},
+        "coas": coas, "reviews": reviews,
+        "scores": [{"coa_id": s["coa"]["coa_id"], "by_profile": s["scores"]} for s in scored],
+        "chosen": best["coa"]["coa_id"], "errors": errors,
+        "elapsed_s": round(time.monotonic() - t0, 2),
+    })
+    return _render_plan(best, cfg, unvetted=unvetted)

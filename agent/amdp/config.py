@@ -48,6 +48,7 @@ class AmdpConfig:
     reviewer_max_tokens: int | None = 1800
     call_timeout_s: float = 90.0
     episode_deadline_s: float = 240.0
+    intake_timeout_s: float = 4.0
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -109,6 +110,10 @@ def resolve_amdp_config(config: dict[str, Any] | None) -> AmdpConfig | None:
         episode_deadline_s = float(block.get("episode_deadline_s", 240))
     except (TypeError, ValueError):
         episode_deadline_s = 240.0
+    try:
+        intake_timeout_s = float(block.get("intake_timeout_s", 4))
+    except (TypeError, ValueError):
+        intake_timeout_s = 4.0
 
     # decision_profile must name a real scoring profile, else _decide would
     # KeyError on every turn (a typo like 'balanced' would silently disable
@@ -143,5 +148,6 @@ def resolve_amdp_config(config: dict[str, Any] | None) -> AmdpConfig | None:
         reviewer_max_tokens=reviewer_max_tokens,
         call_timeout_s=call_timeout_s,
         episode_deadline_s=episode_deadline_s,
+        intake_timeout_s=intake_timeout_s,
         raw=block,
     )
