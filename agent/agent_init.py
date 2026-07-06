@@ -857,6 +857,10 @@ def init_agent(
             agent.model or "default",
             reference_callback=_moa_reference_relay,
         )
+        # Keep the relay reachable so _ensure_primary_openai_client can rewire
+        # it when the facade has to be rebuilt mid-session (e.g. after a soft
+        # cache eviction Nones the shared client).
+        agent._moa_reference_relay = _moa_reference_relay
         agent._client_kwargs = {}
         agent.api_key = api_key or "moa-virtual-provider"
         agent.base_url = "moa://local"

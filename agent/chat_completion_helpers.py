@@ -353,8 +353,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
             elif agent.provider == "moa":
                 # MoA is a virtual chat-completions provider backed by the
                 # in-process MoAClient facade. Do not rebuild a request-local
-                # OpenAI client from the virtual runtime metadata.
-                result["response"] = agent.client.chat.completions.create(**api_kwargs)
+                # OpenAI client from the virtual runtime metadata. Route
+                # through _ensure_primary_openai_client so a Noned-out client
+                # (soft cache eviction, session self-heal) is rebuilt as a
+                # facade instead of crashing on NoneType .chat access.
+                moa_client = agent._ensure_primary_openai_client(
+                    reason="moa_chat_completion_request"
+                )
+                result["response"] = moa_client.chat.completions.create(**api_kwargs)
             else:
                 request_client = _set_request_client(
                     agent._create_request_openai_client(

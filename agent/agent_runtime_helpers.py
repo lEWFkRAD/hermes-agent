@@ -1018,6 +1018,17 @@ def try_recover_primary_transport(
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
+        elif (agent.provider or "").strip().lower() == "moa":
+            # Virtual provider: the primary client is the in-process MoAClient
+            # facade and the snapshot's client_kwargs are intentionally empty,
+            # so the generic OpenAI(**kwargs) rebuild below would raise
+            # "api_key must be set". Rebuild the facade instead.
+            from agent.moa_loop import MoAClient
+
+            agent.client = MoAClient(
+                agent.model or "default",
+                reference_callback=getattr(agent, "_moa_reference_relay", None),
+            )
         else:
             agent.client = agent._create_openai_client(
                 dict(rt["client_kwargs"]),
@@ -1190,6 +1201,17 @@ def restore_primary_runtime(agent) -> bool:
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
+        elif (agent.provider or "").strip().lower() == "moa":
+            # Virtual provider: rebuild the MoAClient facade — the snapshot's
+            # client_kwargs are intentionally empty and the generic
+            # OpenAI(**kwargs) rebuild below would raise "api_key must be set",
+            # failing the restore. Mirrors switch_model's moa branch.
+            from agent.moa_loop import MoAClient
+
+            agent.client = MoAClient(
+                agent.model or "default",
+                reference_callback=getattr(agent, "_moa_reference_relay", None),
+            )
         else:
             agent.client = agent._create_openai_client(
                 dict(rt["client_kwargs"]),
@@ -1887,7 +1909,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.api_key = api_key or "moa-virtual-provider"
             agent.base_url = "moa://local"
             agent._client_kwargs = {}
-            agent.client = MoAClient(agent.model or "default")
+            agent.client = MoAClient(
+                agent.model or "default",
+                reference_callback=getattr(agent, "_moa_reference_relay", None),
+            )
         elif api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
