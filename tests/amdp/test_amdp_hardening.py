@@ -39,7 +39,7 @@ def audit_tmp(tmp_path, monkeypatch):
 
 @pytest.fixture
 def healthy_state(monkeypatch):
-    monkeypatch.setattr(loop, "_intake", lambda config: {
+    monkeypatch.setattr(loop, "_intake", lambda config, timeout_s=None: {
         "brief": "calm", "sensors_down": [], "staleness_s": 0.0,
         "verdict": "ok", "gateway_state": "running", "system_count": 3})
 
@@ -167,7 +167,7 @@ def test_hook_path_resolves_config_once_and_caches(monkeypatch, tmp_path):
                          "gate": {"min_estimated_steps": 1}}}
 
     monkeypatch.setattr(hc, "load_config", fake_load)
-    monkeypatch.setattr(loop, "_intake", lambda c: {
+    monkeypatch.setattr(loop, "_intake", lambda c, timeout_s=None: {
         "brief": "x", "sensors_down": [], "staleness_s": 0.0,
         "verdict": "ok", "gateway_state": "running", "system_count": 1})
     monkeypatch.setattr(loop, "_call",
@@ -196,3 +196,63 @@ def test_hook_path_misconfig_caches_disabled_loud(monkeypatch, caplog):
         assert loop.maybe_amdp_context(MULTISTEP, []) == ""
     assert calls["n"] == 1  # resolved+cached once, not re-attempted every turn
     assert any("MISCONFIGURED" in r.message for r in caplog.records)
+
+
+def _counting_call():
+    calls = []
+
+    def fc(slot, messages, *, temperature, max_tokens, json_mode=False):
+        calls.append(slot.get("provider"))
+        return (COA_JSON, "") if slot.get("provider") == "planner-prov" else (REVIEW_JSON, "")
+    return calls, fc
+
+
+# TUNING-1: plan ONCE per user turn — a repeat call for the same turn (tool-loop
+# iteration) is a cache hit with zero new model calls.
+def test_once_per_turn_caches(monkeypatch, healthy_state, audit_tmp):
+    calls, fc = _counting_call()
+    monkeypatch.setattr(loop, "_call", fc)
+    msgs = [{"role": "user", "content": "do the migration end-to-end and deploy"}]
+    out1 = loop.maybe_amdp_context(MULTISTEP, msgs, ENABLED_CFG)
+    out2 = loop.maybe_amdp_context(MULTISTEP, msgs, ENABLED_CFG)  # same turn -> cache hit
+    assert out1 and out1 == out2 and "AMDP plan" in out1
+    assert calls.count("planner-prov") == 1  # planned once, NOT re-planned per iteration
+
+
+# TUNING-1 (cont.): a genuinely new user turn re-plans.
+def test_new_user_turn_replans(monkeypatch, healthy_state, audit_tmp):
+    calls, fc = _counting_call()
+    monkeypatch.setattr(loop, "_call", fc)
+    loop.maybe_amdp_context("Migrate pipeline A end-to-end and deploy it", [{"role": "user", "content": "A"}], ENABLED_CFG)
+    loop.maybe_amdp_context("Migrate pipeline B end-to-end and deploy it", [{"role": "user", "content": "B"}], ENABLED_CFG)
+    assert calls.count("planner-prov") == 2  # different turns -> two episodes
+
+
+# TUNING-2: a DOWN dashboard (but gateway status present) does NOT refuse — AMDP
+# plans on gateway status alone rather than declining under load.
+def test_dashboard_down_still_plans(monkeypatch, audit_tmp):
+    monkeypatch.setattr(loop, "_intake", lambda config, timeout_s=None: {
+        "brief": "gateway: running; dashboard unavailable — planning on gateway status alone",
+        "sensors_down": [], "staleness_s": 0.0, "verdict": "unknown",
+        "gateway_state": "running", "system_count": 0, "dashboard_up": False})
+    calls, fc = _counting_call()
+    monkeypatch.setattr(loop, "_call", fc)
+    out = loop.maybe_amdp_context(MULTISTEP, [], ENABLED_CFG)
+    assert out and "AMDP plan" in out  # planned despite the dashboard being down
+    assert calls.count("planner-prov") == 1
+
+
+# TUNING-2 (cont.): the configured intake timeout is passed through to intake.
+def test_intake_timeout_is_passed(monkeypatch, audit_tmp):
+    seen = {}
+
+    def fake_intake(config, timeout_s=None):
+        seen["t"] = timeout_s
+        return {"brief": "x", "sensors_down": [], "staleness_s": 0.0,
+                "verdict": "ok", "gateway_state": "running", "system_count": 1}
+
+    monkeypatch.setattr(loop, "_intake", fake_intake)
+    monkeypatch.setattr(loop, "_call",
+                        lambda slot, m, **k: (COA_JSON if slot.get("provider") == "planner-prov" else REVIEW_JSON, ""))
+    loop.maybe_amdp_context(MULTISTEP, [], ENABLED_CFG)
+    assert seen["t"] == 4.0  # default intake_timeout_s

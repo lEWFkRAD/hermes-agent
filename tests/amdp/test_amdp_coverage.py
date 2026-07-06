@@ -61,7 +61,7 @@ def audit_tmp(tmp_path, monkeypatch):
 
 @pytest.fixture
 def healthy_state(monkeypatch):
-    monkeypatch.setattr(loop, "_intake", lambda config: {
+    monkeypatch.setattr(loop, "_intake", lambda config, timeout_s=None: {
         "brief": "all calm", "sensors_down": [], "staleness_s": 0.0,
         "verdict": "ok", "gateway_state": "running", "system_count": 3,
     })
@@ -167,7 +167,7 @@ def test_reviewer_failure_does_not_crash_full_turn(monkeypatch, healthy_state, a
 # (test_amdp.py::test_stale_state_refuses never checks the audit).
 # --------------------------------------------------------------------------- #
 def test_stale_state_refusal_is_audited(monkeypatch, audit_tmp):
-    monkeypatch.setattr(loop, "_intake", lambda config: {
+    monkeypatch.setattr(loop, "_intake", lambda config, timeout_s=None: {
         "brief": "", "sensors_down": [], "staleness_s": 999.0,
         "verdict": "ok", "gateway_state": "running", "system_count": 3,
     })
@@ -183,9 +183,14 @@ def test_stale_state_refusal_is_audited(monkeypatch, audit_tmp):
 # _should_refuse direct unit coverage (both branches + the pass case)
 # --------------------------------------------------------------------------- #
 def test_should_refuse_branches():
+    # Only a missing gateway status (truly blind) refuses — a down dashboard does not.
     down, reason = loop._should_refuse(
-        {"sensors_down": ["dashboard"], "staleness_s": 0}, staleness_max_s=120)
-    assert down and "dashboard" in reason
+        {"sensors_down": ["gateway-status"], "staleness_s": 0}, staleness_max_s=120)
+    assert down and "gateway status" in reason
+    # A down dashboard alone (not in the blinding set) does NOT refuse.
+    nodash, _ = loop._should_refuse(
+        {"sensors_down": [], "staleness_s": 0}, staleness_max_s=120)
+    assert nodash is False
     stale, reason = loop._should_refuse(
         {"sensors_down": [], "staleness_s": 500}, staleness_max_s=120)
     assert stale and "staleness" in reason
@@ -215,7 +220,7 @@ def test_gate_uses_estimate_below_threshold(monkeypatch):
     """A qualifying-content prompt still skips if min_estimated_steps is high,
     and no model or intake call happens."""
     called = {"intake": 0, "model": 0}
-    monkeypatch.setattr(loop, "_intake", lambda c: called.__setitem__("intake", called["intake"] + 1) or {})
+    monkeypatch.setattr(loop, "_intake", lambda c, timeout_s=None: called.__setitem__("intake", called["intake"] + 1) or {})
     monkeypatch.setattr(loop, "_call", lambda *a, **k: called.__setitem__("model", called["model"] + 1) or ("", ""))
     cfg = {"amdp": dict(ENABLED_CFG["amdp"], gate={"min_estimated_steps": 99})}
     out = loop.maybe_amdp_context(MULTISTEP_PROMPT, [], cfg)

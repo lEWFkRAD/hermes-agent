@@ -50,7 +50,7 @@ def audit_tmp(tmp_path, monkeypatch):
 
 @pytest.fixture
 def healthy_state(monkeypatch):
-    monkeypatch.setattr(loop, "_intake", lambda config: {
+    monkeypatch.setattr(loop, "_intake", lambda config, timeout_s=None: {
         "brief": "all calm", "sensors_down": [], "staleness_s": 0.0,
         "verdict": "ok", "gateway_state": "running", "system_count": 3,
     })
@@ -131,19 +131,21 @@ def test_enabled_produces_plan_and_audit(mock_models, healthy_state, audit_tmp):
 # Refuse gate: blind state -> no plan, no model calls, audited
 # --------------------------------------------------------------------------- #
 def test_blind_state_refuses(mock_models, monkeypatch, audit_tmp):
-    monkeypatch.setattr(loop, "_intake", lambda config: {
-        "brief": "", "sensors_down": ["dashboard"], "staleness_s": 0.0,
-        "verdict": "unknown", "gateway_state": "starting", "system_count": 0,
+    # Truly blind = no gateway status. (A down DASHBOARD alone does NOT refuse —
+    # see test_amdp_hardening.test_dashboard_down_still_plans.)
+    monkeypatch.setattr(loop, "_intake", lambda config, timeout_s=None: {
+        "brief": "", "sensors_down": ["gateway-status"], "staleness_s": 0.0,
+        "verdict": "unknown", "gateway_state": "unknown", "system_count": 0,
     })
     out = loop.maybe_amdp_context(MULTISTEP_PROMPT, [], ENABLED_CFG)
     assert out == ""
     assert mock_models == []  # refused before any model call
     rec = json.loads(audit_tmp.read_text(encoding="utf-8").strip())
-    assert rec["refused"] is True and "dashboard" in rec["refuse_reason"]
+    assert rec["refused"] is True and "gateway status" in rec["refuse_reason"]
 
 
 def test_stale_state_refuses(mock_models, monkeypatch, audit_tmp):
-    monkeypatch.setattr(loop, "_intake", lambda config: {
+    monkeypatch.setattr(loop, "_intake", lambda config, timeout_s=None: {
         "brief": "", "sensors_down": [], "staleness_s": 999.0,
         "verdict": "ok", "gateway_state": "running", "system_count": 3,
     })
