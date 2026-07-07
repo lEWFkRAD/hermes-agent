@@ -137,7 +137,7 @@ def resolve_amdp_config(config: dict[str, Any] | None) -> AmdpConfig | None:
         reviewer_max_tokens = 1800
 
     state_feed = str(block.get("state_feed") or "auto").strip().lower()
-    if state_feed not in ("auto", "gateway", "proprioception"):
+    if state_feed not in ("auto", "gateway", "proprioception", "telemetry"):
         logger.warning("amdp.state_feed %r unknown; using auto", state_feed)
         state_feed = "auto"
 

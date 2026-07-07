@@ -87,4 +87,42 @@ def test_state_feed_config_validates():
     base = {"enabled": True, "planner": {"provider": "p", "model": "m"}, "reviewer": {"provider": "r", "model": "m"}}
     assert resolve_amdp_config({"amdp": base}).state_feed == "auto"              # default
     assert resolve_amdp_config({"amdp": dict(base, state_feed="gateway")}).state_feed == "gateway"
+    assert resolve_amdp_config({"amdp": dict(base, state_feed="telemetry")}).state_feed == "telemetry"
     assert resolve_amdp_config({"amdp": dict(base, state_feed="bogus")}).state_feed == "auto"  # unknown -> auto
+
+
+# --- telemetry feed (fast, no HTTP dashboard) ---
+def _fake_snap(gateway=True):
+    return {
+        "collected_at": 0,  # stale -> forces a live snapshot() in the feed
+        "gateway": {"gateway_state": "running"} if gateway else None,
+        "gpu": [{"name": "RTX", "temp_c": 70, "vram_used_mb": 1000, "vram_total_mb": 2000}],
+        "disk": {"free_gb": "100G", "total_gb": "500G"},
+        "network": {"tailscale_peers_online": 3, "total_peers": 5},
+    }
+
+
+def test_telemetry_feed_collects_and_maps(monkeypatch):
+    from plugins.proprioception import telemetry
+    monkeypatch.setattr(telemetry, "load", lambda: None)
+    monkeypatch.setattr(telemetry, "snapshot", lambda: _fake_snap(gateway=True))
+    s = state.telemetry_feed({})
+    assert s["sensors_down"] == [] and s["gateway_state"] == "running"
+    assert "GPU RTX" in s["brief"] and "tailscale" in s["brief"]
+    assert s["system_count"] == 3
+
+
+def test_telemetry_feed_blind_without_gateway(monkeypatch):
+    from plugins.proprioception import telemetry
+    monkeypatch.setattr(telemetry, "load", lambda: None)
+    monkeypatch.setattr(telemetry, "snapshot", lambda: _fake_snap(gateway=False))
+    s = state.telemetry_feed({})
+    assert "gateway-status" in s["sensors_down"]   # no gateway status -> truly blind
+
+
+def test_telemetry_mode_routes(monkeypatch):
+    from plugins.proprioception import telemetry
+    monkeypatch.setattr(telemetry, "load", lambda: None)
+    monkeypatch.setattr(telemetry, "snapshot", lambda: _fake_snap(gateway=True))
+    s = state.get_believed_state({}, mode="telemetry")
+    assert s["gateway_state"] == "running" and s["sensors_down"] == []
