@@ -1,9 +1,10 @@
 """AMDP episode loop, integrated into the agent runtime.
 
-Same shape as the proven out-of-tree prototype, but wired to real
-infrastructure: model calls go through ``agent.auxiliary_client.call_llm``
-(resolved via MoA's ``_slot_runtime``), and believed state comes from the
-proprioception collector's snapshot instead of raw HTTP.
+Model calls go through ``agent.auxiliary_client.call_llm`` (resolved via MoA's
+``_slot_runtime``). Believed state comes from a pluggable state feed (see
+``state.py``): the universal ``gateway`` feed by default, with the
+proprioception plugin as optional enrichment when installed. AMDP has no hard
+dependency on any monitoring plugin.
 
 ``maybe_amdp_context`` is the single entry point the conversation loop calls.
 It is fail-closed: it returns ``""`` (inject nothing, proceed normally) on a
@@ -41,6 +42,10 @@ _AUDIT_LOCK = threading.Lock()
 # suite's mock _call signature stays stable; concurrent episodes use a similar
 # value so the benign race is harmless.
 _active_call_timeout: float = 90.0
+# Active state-feed mode for the current episode, set from cfg.state_feed. A
+# module global (not an _intake kwarg) so the test suite's mock _intake
+# signature stays stable — same pattern as _active_call_timeout.
+_active_state_feed: str = "auto"
 
 # Startup-resolved config cache. Resolved ONCE (first turn on the hook path),
 # then reused, so the disabled/absent path costs a cheap identity check instead
@@ -158,72 +163,17 @@ def _call(
 
 
 # --------------------------------------------------------------------------- #
-# State intake (proprioception collector)
+# State intake (via a pluggable state feed — see state.py)
 # --------------------------------------------------------------------------- #
-def _proprioception_settings(config: dict[str, Any]) -> dict[str, Any]:
-    from plugins.proprioception.settings import DEFAULTS
-
-    merged = dict(DEFAULTS)
-    block = (config or {}).get("proprioception")
-    if isinstance(block, dict):
-        merged.update(block)
-    return merged
-
-
 def _intake(config: dict[str, Any], timeout_s: float | None = None) -> dict[str, Any]:
-    """Return {brief, sensors_down, staleness_s, ...} from the live snapshot.
-    Never raises. The dashboard is OPTIONAL enrichment — a down/slow dashboard
-    is recorded but does NOT block planning; only a missing gateway status
-    (``gateway-status`` in sensors_down) means we're truly blind."""
-    try:
-        from plugins.proprioception.collector import ATTENTION_STATES, get_snapshot
+    """Return {brief, sensors_down, staleness_s, ...} from the configured state
+    feed. Never raises. The source is pluggable (``gateway`` universal default /
+    ``proprioception`` enrichment / ``auto``); enrichment being unavailable
+    degrades gracefully — only a missing gateway status (``gateway-status`` in
+    sensors_down) or excessive staleness blinds the planner."""
+    from agent.amdp import state
 
-        settings = _proprioception_settings(config)
-        # A merely-slow dashboard shouldn't cause a refusal — give the fetch a
-        # larger budget than the heartbeat's default so AMDP can read it under
-        # load (the ops dashboard can respond in ~3s on a busy box).
-        if timeout_s:
-            settings = {**settings, "timeout_seconds": float(timeout_s)}
-        # force=False: honor the collector's 30s TTL and shared-cache design.
-        snap = get_snapshot(settings, force=False)
-        systems = (snap.dashboard or {}).get("systems") or []
-        attention = [
-            s for s in systems if isinstance(s, dict) and str(s.get("state")) in ATTENTION_STATES
-        ]
-        dashboard_up = snap.dashboard is not None
-        verdict = "attention" if attention else ("ok" if dashboard_up else "unknown")
-
-        # Report what's down for the audit/brief, but the dashboard being down
-        # is enrichment-absent, not blindness. Keep only the truly-blinding
-        # sensor (gateway-status) in the refuse-triggering set.
-        raw_down = list(snap.sensors_down)
-        blinding = ["gateway-status"] if "gateway-status" in raw_down else []
-
-        lines = [f"overall verdict: {verdict}", f"gateway: {snap.gateway_state}"]
-        if not dashboard_up:
-            lines.append("system dashboard unavailable — planning on gateway status alone")
-        if snap.dashboard_stale_for:
-            lines.append(f"state staleness: {snap.dashboard_stale_for:.0f}s")
-        if attention:
-            lines.append("systems needing attention:")
-            for s in attention[:12]:
-                lines.append(f"  - {s.get('label', s.get('id', '?'))}: {s.get('state')} ({s.get('detail', '')})")
-        elif dashboard_up:
-            lines.append(f"all {len(systems)} monitored systems calm")
-        return {
-            "brief": "\n".join(lines),
-            "sensors_down": blinding,          # only truly-blinding sensors gate planning
-            "dashboard_up": dashboard_up,      # informational
-            "staleness_s": float(snap.dashboard_stale_for or 0.0),
-            "verdict": verdict,
-            "gateway_state": snap.gateway_state,
-            "system_count": len(systems),
-        }
-    except Exception as exc:
-        logger.warning("AMDP state intake failed: %s", exc)
-        # A total intake failure IS blinding — no state at all.
-        return {"brief": "", "sensors_down": ["gateway-status"], "staleness_s": 0.0,
-                "verdict": "unknown", "gateway_state": "unknown", "system_count": 0, "dashboard_up": False}
+    return state.get_believed_state(config or {}, timeout_s=timeout_s, mode=_active_state_feed)
 
 
 def _should_refuse(state: dict[str, Any], *, staleness_max_s: float) -> tuple[bool, str]:
@@ -486,8 +436,9 @@ def _plan_turn(
     """Run one AMDP episode for a fresh user turn. Returns the plan block or "".
     Wrapped by maybe_amdp_context's cache + top-level fail-closed guard."""
     t0 = time.monotonic()
-    global _active_call_timeout
+    global _active_call_timeout, _active_state_feed
     _active_call_timeout = cfg.call_timeout_s
+    _active_state_feed = cfg.state_feed
 
     est = _estimate_steps(user_prompt, api_messages)
     if est < cfg.min_estimated_steps:
