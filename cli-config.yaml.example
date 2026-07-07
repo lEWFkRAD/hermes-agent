@@ -1606,3 +1606,38 @@ updates:
 #     command: "cat /run/user/1000/hermes-secrets.env"
 #     helper_timeout_seconds: 3
 #     override_existing: false             # .env/shell win by default
+
+# =============================================================================
+# AMDP — Agent Maneuver Decision Process (optional, default OFF)
+# =============================================================================
+# An opt-in planning layer for the orchestration loop. On multi-step turns it
+# has a "commander" model propose several distinct courses of action, a
+# "reviewer" model adversarially war-game each for failure modes, scores them,
+# picks one, and injects the chosen plan into the turn. It plans at most once
+# per user turn, is fail-closed (a planner error never breaks a turn), and
+# refuses to plan when it cannot read the system's state (never plans blind).
+# Every decision is written to an append-only audit log.
+#
+# amdp:
+#   enabled: false                 # master switch; false = zero behavioral change
+#   planner:                       # the commander — proposes courses of action
+#     provider: my-local           # any provider in `providers:` (or a task provider)
+#     model: my-aggregator-model
+#   reviewer:                      # war-games each course of action
+#     provider: my-reviewer
+#     model: my-reviewer-model
+#   n_coas: 3                      # how many distinct plans to generate
+#   gate:
+#     min_estimated_steps: 3       # only turns this dispatch-worthy trigger planning
+#   staleness_max_s: 120           # refuse to plan on state older than this
+#   state_feed: auto               # auto | gateway | proprioception
+#                                  #   gateway = universal (gateway runtime status only)
+#                                  #   proprioception = richer state if the plugin is installed
+#                                  #   auto = proprioception if available, else gateway
+#   intake_timeout_s: 4            # budget for reading believed state
+#   call_timeout_s: 90             # per model call
+#   episode_deadline_s: 240        # abort a planning episode past this
+#   reviewer_max_tokens: 1800      # cap reviewer output; null = uncapped
+#   decision_profile: v1_balanced  # scoring profile
+#   hitl_gate_irreversible: true   # flag irreversible dispatches for human approval
+#   audit_log: amdp_audit.jsonl    # under HERMES_HOME

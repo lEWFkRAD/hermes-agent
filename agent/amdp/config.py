@@ -49,6 +49,7 @@ class AmdpConfig:
     call_timeout_s: float = 90.0
     episode_deadline_s: float = 240.0
     intake_timeout_s: float = 4.0
+    state_feed: str = "auto"          # auto | gateway | proprioception
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -135,6 +136,11 @@ def resolve_amdp_config(config: dict[str, Any] | None) -> AmdpConfig | None:
         logger.warning("amdp.reviewer_max_tokens %r invalid; using 1800", rmt)
         reviewer_max_tokens = 1800
 
+    state_feed = str(block.get("state_feed") or "auto").strip().lower()
+    if state_feed not in ("auto", "gateway", "proprioception"):
+        logger.warning("amdp.state_feed %r unknown; using auto", state_feed)
+        state_feed = "auto"
+
     return AmdpConfig(
         enabled=True,
         planner={"provider": str(planner["provider"]).strip(), "model": str(planner["model"]).strip()},
@@ -149,5 +155,6 @@ def resolve_amdp_config(config: dict[str, Any] | None) -> AmdpConfig | None:
         call_timeout_s=call_timeout_s,
         episode_deadline_s=episode_deadline_s,
         intake_timeout_s=intake_timeout_s,
+        state_feed=state_feed,
         raw=block,
     )
