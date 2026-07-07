@@ -47,6 +47,9 @@ class Snapshot:
     dashboard_error: str = ""
     gateway: Optional[Dict[str, Any]] = None
     gateway_error: str = ""
+    # Native telemetry (GPU, disk, network, logprobs proxy)
+    native: Optional[Dict[str, Any]] = None
+    native_error: str = ""
     # >0 when the dashboard payload was served from the last-known-good
     # grace window: seconds since that data was actually fetched. The
     # heartbeat stays silent during grace, but the body_state tool must
@@ -101,6 +104,19 @@ def _fetch_gateway_status() -> Optional[Dict[str, Any]]:
     return read_runtime_status()
 
 
+def _fetch_native_telemetry() -> Optional[Dict[str, Any]]:
+    """Load native telemetry from telemetry.json. Returns None on failure."""
+    from plugins.proprioception.telemetry import load as load_telemetry
+    try:
+        data = load_telemetry()
+        if isinstance(data, dict):
+            return data
+        return None
+    except Exception as exc:
+        logger.debug("proprioception: native telemetry load failed: %s", exc)
+        return None
+
+
 def _do_refresh(settings: Dict[str, Any]) -> Snapshot:
     """Perform the actual (potentially slow) collection. No locks held."""
     global _LAST_GOOD_DASHBOARD, _LAST_GOOD_AT
@@ -129,6 +145,14 @@ def _do_refresh(settings: Dict[str, Any]) -> Snapshot:
     except Exception as exc:
         snap.gateway_error = f"{type(exc).__name__}: {exc}"[:200]
         logger.debug("proprioception: gateway status read failed: %s", snap.gateway_error)
+
+    # Native telemetry (GPU, disk, network, logprobs proxy)
+    try:
+        snap.native = _fetch_native_telemetry()
+    except Exception as exc:
+        snap.native_error = f"{type(exc).__name__}: {exc}"[:200]
+        logger.debug("proprioception: native telemetry failed: %s", snap.native_error)
+
     return snap
 
 

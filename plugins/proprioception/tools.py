@@ -133,5 +133,37 @@ def handle_body_state(args: Dict[str, Any], **_kw: Any) -> str:
     elif snap.gateway_error:
         lines.append(f"Gateway self-report unavailable: {snap.gateway_error}")
 
+    # Native telemetry (GPU, disk, network, logprobs proxy)
+    if snap.native is not None:
+        lines.append("")
+        lines.append("Native telemetry:")
+        gpu = snap.native.get("gpu")
+        if isinstance(gpu, list):
+            for g in gpu:
+                lines.append(
+                    f"  GPU: {g.get('name', '?')} @ {g.get('temp_c', '?')}C, "
+                    f"{g.get('vram_used_mb', '?')}MB / {g.get('vram_total_mb', '?')}MB"
+                )
+        elif isinstance(gpu, dict):
+            lines.append(f"  GPU: {gpu.get('error', 'unknown')}")
+
+        disk = snap.native.get("disk")
+        if isinstance(disk, dict) and "free_gb" in disk:
+            lines.append(f"  Disk: {disk['free_gb']} free of {disk['total_gb']}")
+        elif isinstance(disk, dict):
+            lines.append(f"  Disk: {disk.get('error', 'unknown')}")
+
+        net = snap.native.get("network")
+        if isinstance(net, dict) and "tailscale_peers_online" in net:
+            lines.append(f"  Network: {net['tailscale_peers_online']}/{net['total_peers']} Tailscale peers online")
+        elif isinstance(net, dict):
+            lines.append(f"  Network: {net.get('error', 'unknown')}")
+
+        lp = snap.native.get("logprobs_proxy")
+        if isinstance(lp, dict):
+            lines.append(f"  Logprobs proxy: {lp.get('status', 'inactive')}")
+    elif snap.native_error:
+        lines.append(f"\nNative telemetry unavailable: {snap.native_error}")
+
     lines.append("(sources: command-center rollup + gateway state file; fetched live)")
     return "\n".join(lines)
