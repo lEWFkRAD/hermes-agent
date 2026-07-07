@@ -193,15 +193,22 @@ def _should_refuse(state: dict[str, Any], *, staleness_max_s: float) -> tuple[bo
 # ("first, thanks; then...") and would tax a chat turn with a 30-60s planning
 # episode. Keep multi-word / task-shaped markers only.
 _MULTISTEP_HINTS = re.compile(
-    r"\b(migrate|refactor|pipeline|deploy|and then|after that|step\s*\d|each of|"
-    r"all of|for every|for each|end[- ]to[- ]end|multi[- ]step)\b",
+    r"\b(migrate|refactor|pipeline|deploy|and then|after that|step\s*\d|phase\s*\d|"
+    r"each of|all of|for every|for each|end[- ]to[- ]end|multi[- ]step|"
+    r"exec\w*|implement|build\s*out|carry\s*out|roll\s*out|wire\s*up|scaffold)\b",
     re.IGNORECASE,
 )
 
 
 def _estimate_steps(user_prompt: Any, api_messages: list[dict[str, Any]]) -> int:
     """Very cheap dispatch-worthiness estimate. Don't spend a model call deciding
-    whether to spend model calls."""
+    whether to spend model calls.
+
+    Terse execution orders ("execu phase 1", "implement it") are as multi-step as
+    verbose ones ("migrate the pipeline") — the hint set now covers execution verbs
+    and phase markers, not just planning phrasing. And a turn arriving mid-build
+    (lots of prior tool activity) is dispatch-worthy on its own: a short "continue"
+    after 8+ tool calls is real work, not chat."""
     text = user_prompt if isinstance(user_prompt, str) else ""
     score = 0
     score += len(_MULTISTEP_HINTS.findall(text))
@@ -210,6 +217,8 @@ def _estimate_steps(user_prompt: Any, api_messages: list[dict[str, Any]]) -> int
         score += 1
     tool_msgs = sum(1 for m in api_messages if isinstance(m, dict) and m.get("role") == "tool")
     if tool_msgs >= 3:
+        score += 1
+    if tool_msgs >= 8:  # a build/investigation is well underway — terse orders count
         score += 1
     return score
 
