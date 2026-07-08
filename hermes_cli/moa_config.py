@@ -313,6 +313,10 @@ def _default_preset() -> dict[str, Any]:
         "reference_recent_turns": 4,
         "reference_context_budget": 24000,
         "reference_constraints": "",
+        # Opt-in final-submission review (default OFF): a reference sanity-checks
+        # the drafted final answer before it reaches the user; the aggregator
+        # revises once on a material flag. See agent/moa_final_review.py.
+        "final_review": False,
     }
 
 
@@ -379,6 +383,7 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         "reference_recent_turns": _coerce_int(raw.get("reference_recent_turns"), 4),
         "reference_context_budget": _coerce_int(raw.get("reference_context_budget"), 24000),
         "reference_constraints": str(raw.get("reference_constraints") or ""),
+        "final_review": bool(raw.get("final_review", False)),
     }
 
 
@@ -428,6 +433,7 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "max_tokens": active["max_tokens"],
         "reference_max_tokens": active.get("reference_max_tokens"),
         "fanout": active.get("fanout", "user_turn"),
+        "final_review": active.get("final_review", False),
         "enabled": active["enabled"],
         # MoA-level (not per-preset) toggles ride at the top level alongside
         # save_traces. privacy_filter: '' (off, default) | 'display' | 'full'

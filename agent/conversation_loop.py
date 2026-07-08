@@ -6516,6 +6516,18 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # MoA final-submission review (opt-in preset.final_review): a reference model
+    # sanity-checks the drafted final answer before it reaches the user, and the
+    # aggregator revises once if a MATERIAL problem is flagged. Bookends
+    # fanout:user_turn (which critiques the plan up front). Fail-open: the module
+    # never raises and internally skips errors / empties / interrupts.
+    if moa_config and not interrupted and not failed:
+        try:
+            from agent.moa_final_review import maybe_final_review
+            final_response = maybe_final_review(agent, final_response, messages, moa_config)
+        except Exception as _fr_exc:
+            logger.warning("MoA final review hook error (ignored): %s", _fr_exc)
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
