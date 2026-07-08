@@ -124,7 +124,7 @@ def _coerce_fanout(value: Any) -> str:
             return "per_iteration" if n == 1 else "user_turn"
         value = mode
     mode = str(value or "").strip().lower()
-    if mode in {"per_iteration", "user_turn"}:
+    if mode in {"per_iteration", "user_turn", "first_turn"}:
         return mode
     if mode.startswith("every_n"):
         _, sep, rest = mode.partition(":")

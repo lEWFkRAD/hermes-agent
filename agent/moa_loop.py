@@ -275,6 +275,25 @@ def _slot_label(slot: dict[str, Any]) -> str:
     return f"{label}[reasoning={effort}]" if effort else label
 
 
+def _first_turn_skip(fanout_mode: str, ref_messages: list) -> bool:
+    """first_turn cadence: references run only during the OPENING user turn of the
+    session (the plan). On every later user turn the aggregator acts alone and the
+    final-submission review (preset.final_review) is the other bookend. Returns True
+    when references should be skipped for this call. The synthetic
+    ``_ADVISORY_INSTRUCTION`` marker appended mid-tool-loop is NOT a real user turn,
+    so it is excluded from the count (matching the user_turn prefix logic)."""
+    if fanout_mode != "first_turn":
+        return False
+    real_user_turns = sum(
+        1
+        for m in ref_messages
+        if isinstance(m, dict)
+        and m.get("role") == "user"
+        and m.get("content") != _ADVISORY_INSTRUCTION
+    )
+    return real_user_turns > 1
+
+
 def _slot_reasoning_config(slot: dict[str, Any]) -> dict[str, Any] | None:
     """Translate optional per-MoA-slot reasoning_effort into runtime config."""
     effort = slot.get("reasoning_effort")
@@ -2026,7 +2045,7 @@ class MoAChatCompletions:
                 fanout_mode = "per_iteration"
         sig_messages = ref_messages
         turn_prefix = ref_messages
-        if fanout_mode in ("user_turn",) or every_n >= 2:
+        if fanout_mode in ("user_turn", "first_turn") or every_n >= 2:
             # Find the last REAL user message. The advisory view appends a
             # synthetic user marker (_ADVISORY_INSTRUCTION) when it ends on an
             # assistant turn — i.e. on every tool iteration after the first —
@@ -2042,7 +2061,7 @@ class MoAChatCompletions:
                     break
             if last_user_idx is not None:
                 turn_prefix = ref_messages[: last_user_idx + 1]
-            if fanout_mode == "user_turn":
+            if fanout_mode in ("user_turn", "first_turn"):
                 sig_messages = turn_prefix
 
         def _hash_messages(msgs: list[dict[str, Any]]) -> str:
@@ -2088,7 +2107,15 @@ class MoAChatCompletions:
             _cache_key = self._ref_cache_key
         _refs_from_cache = _cache_key == self._ref_cache_key and bool(self._ref_cache_outputs)
 
-        if _refs_from_cache:
+        if _first_turn_skip(fanout_mode, ref_messages):
+            # Past the opening user turn in first_turn mode: the aggregator acts
+            # alone (no reference fan-out, no display). The final-submission review
+            # (preset.final_review) is the other bookend.
+            reference_outputs = []
+            self._pending_reference_usage = CanonicalUsage()
+            self._pending_reference_cost = None
+            self._pending_trace = None
+        elif _refs_from_cache:
             reference_outputs = list(self._ref_cache_outputs)
             # References already ran (and were accounted) earlier this turn;
             # this create() is a repeat tool-iteration reusing the cached
