@@ -70,7 +70,7 @@ def _coerce_int_or_none(value: Any) -> int | None:
 def _coerce_fanout(value: Any) -> str:
     """Normalize the fan-out cadence; unknown values fall back to default."""
     mode = str(value or "").strip().lower()
-    return mode if mode in {"per_iteration", "user_turn"} else "per_iteration"
+    return mode if mode in {"per_iteration", "user_turn", "first_turn"} else "per_iteration"
 
 
 def _clean_slot(slot: Any) -> dict[str, str] | None:
