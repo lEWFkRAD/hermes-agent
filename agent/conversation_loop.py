@@ -6521,7 +6521,7 @@ def run_conversation(
     # aggregator revises once if a MATERIAL problem is flagged. Bookends
     # fanout:user_turn (which critiques the plan up front). Fail-open: the module
     # never raises and internally skips errors / empties / interrupts.
-    if moa_config and not interrupted and not failed:
+    if (moa_config or getattr(agent, "provider", None) == "moa") and not interrupted and not failed:
         try:
             from agent.moa_final_review import maybe_final_review
             final_response = maybe_final_review(agent, final_response, messages, moa_config)

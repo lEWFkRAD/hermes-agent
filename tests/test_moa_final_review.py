@@ -100,6 +100,35 @@ def test_flag_is_material():
     assert fr._flag_is_material("") is False  # blank => ship as-is
 
 
+class _Agent:
+    def __init__(self, provider=None, model=None):
+        self.provider = provider
+        self.model = model
+
+
+def test_path_b_resolves_active_preset(monkeypatch):
+    # moa_config None (the -m <preset> path), but the agent is a moa preset:
+    # the module resolves the active preset and still reviews.
+    calls = _patch_calls(monkeypatch, "OK")
+    monkeypatch.setattr(fr, "_resolve_active_moa", lambda a: _cfg())
+    out = fr.maybe_final_review(_Agent("moa", "moa-personal"), _ANSWER, _MSGS, None)
+    assert out == _ANSWER
+    assert len(calls) == 1  # reviewer ran => path-B engaged
+
+
+def test_non_moa_agent_untouched(monkeypatch):
+    calls = _patch_calls(monkeypatch, "flag")
+    out = fr.maybe_final_review(_Agent("anthropic", "claude"), _ANSWER, _MSGS, None)
+    assert out == _ANSWER
+    assert calls == []  # non-moa agent + no config => never calls a model
+
+
+def test_resolve_active_moa_off_path():
+    assert fr._resolve_active_moa(_Agent("openai", "gpt-4")) is None
+    assert fr._resolve_active_moa(_Agent(None, None)) is None
+    assert fr._resolve_active_moa(None) is None
+
+
 def test_normalizer_preserves_final_review():
     assert _normalize_preset({"final_review": True})["final_review"] is True
     assert _normalize_preset({})["final_review"] is False

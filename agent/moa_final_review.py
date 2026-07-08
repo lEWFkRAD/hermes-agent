@@ -159,16 +159,37 @@ def _flag_is_material(verdict: str) -> bool:
     return True
 
 
+def _resolve_active_moa(agent: Any) -> Any:
+    """Resolve the active MoA preset from the agent when moa_config wasn't threaded
+    into run_conversation. That happens on the common ``-m <preset>`` path: the model
+    resolves to provider ``moa`` and the fan-out lives in the facade, so the loop's
+    ``moa_config`` param is None. The facade itself uses agent.model as the preset
+    name (agent_init.py), so we mirror that. Returns None off the MoA path or on error."""
+    try:
+        if getattr(agent, "provider", None) != "moa":
+            return None
+        preset_name = getattr(agent, "model", None) or "default"
+        from hermes_cli.config import load_config
+        from hermes_cli.moa_config import resolve_moa_preset
+
+        return resolve_moa_preset(load_config().get("moa") or {}, preset_name)
+    except Exception:
+        return None
+
+
 def maybe_final_review(agent: Any, final_response: Any, messages: list, moa_config: Any) -> Any:
     """Return the (possibly revised) final answer. Opt-in, fail-open, never raises."""
     try:
-        if not isinstance(moa_config, dict) or not moa_config.get("final_review"):
-            return final_response
         if not _is_substantive(final_response):
             return final_response
+        # Use the threaded moa_config if it enables review (/moa one-shot path);
+        # otherwise resolve the agent's active preset (the -m <preset> path).
+        cfg = moa_config if (isinstance(moa_config, dict) and moa_config.get("final_review")) else _resolve_active_moa(agent)
+        if not (isinstance(cfg, dict) and cfg.get("final_review")):
+            return final_response
 
-        refs = moa_config.get("reference_models") or []
-        aggregator = moa_config.get("aggregator") or {}
+        refs = cfg.get("reference_models") or []
+        aggregator = cfg.get("aggregator") or {}
         if not refs or not aggregator:
             return final_response
         reviewer = refs[0]
@@ -188,7 +209,7 @@ def maybe_final_review(agent: Any, final_response: Any, messages: list, moa_conf
                 {"role": "system", "content": _REVIEWER_SYSTEM},
                 {"role": "user", "content": review_user},
             ],
-            temperature=moa_config.get("reference_temperature"),
+            temperature=cfg.get("reference_temperature"),
             max_tokens=_REVIEWER_MAX_TOKENS,
         )
 
@@ -207,8 +228,8 @@ def maybe_final_review(agent: Any, final_response: Any, messages: list, moa_conf
                 {"role": "system", "content": _REVISE_SYSTEM},
                 {"role": "user", "content": revise_user},
             ],
-            temperature=moa_config.get("aggregator_temperature"),
-            max_tokens=moa_config.get("max_tokens") or 4096,
+            temperature=cfg.get("aggregator_temperature"),
+            max_tokens=cfg.get("max_tokens") or 4096,
         )
         if _is_substantive(revised):
             logger.info(
@@ -218,5 +239,5 @@ def maybe_final_review(agent: Any, final_response: Any, messages: list, moa_conf
             return revised
         return final_response
     except Exception as exc:  # fail-open: a review must never break delivery
-        logger.warning("MoA final review skipped (fail-open): %s", exc)
+        logger.info("MoA final review skipped (fail-open): %s", exc)
         return final_response
