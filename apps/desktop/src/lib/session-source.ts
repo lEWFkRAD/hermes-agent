@@ -9,6 +9,7 @@ const SOURCE_LABELS: Record<string, string> = {
   discord: 'Discord',
   email: 'Email',
   gateway: 'Gateway',
+  kindle: 'Kindle',
   local: 'Local',
   matrix: 'Matrix',
   mattermost: 'Mattermost',
@@ -48,6 +49,7 @@ const LOCAL_SOURCE_IDS = new Set(LOCAL_SESSION_SOURCE_IDS)
 // adapters; keep in sync with PLATFORM_ICONS in app/messaging/platform-icon.tsx.
 export const MESSAGING_SESSION_SOURCE_IDS = [
   'telegram',
+  'kindle',
   'discord',
   'slack',
   'mattermost',
