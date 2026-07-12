@@ -1760,7 +1760,11 @@ class GatewayStreamConsumer:
                     content=text,
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
-                        final=finalize,
+                        # A tool-boundary segment is complete, but it is not
+                        # the assistant turn's final answer.  Adapters such as
+                        # Kindle use notify=True as the durable end-of-stream
+                        # signal, so only set it for the true turn final.
+                        final=(finalize and is_turn_final),
                         expect_edits=True,
                     ),
                 )

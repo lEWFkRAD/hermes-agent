@@ -462,6 +462,45 @@ class TestSegmentBreakOnToolBoundary:
         assert "results" in second_text
 
     @pytest.mark.asyncio
+    async def test_first_send_notifies_only_for_true_turn_final(self):
+        """A first send at a tool boundary must not close adapter streams."""
+        adapter = MagicMock()
+        msg_counter = iter(["msg_1", "msg_2"])
+        adapter.send = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(
+                success=True, message_id=next(msg_counter),
+            )
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True)
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+
+        # Queue the entire turn before run() so each segment's first visible
+        # frame is also its finalize send: first a tool-boundary segment, then
+        # the actual final answer.
+        consumer.on_delta("Let me check that.")
+        consumer.on_delta(None)
+        consumer.on_delta("Here is the answer.")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert adapter.send.call_count == 2
+        boundary_meta = adapter.send.call_args_list[0].kwargs["metadata"]
+        final_meta = adapter.send.call_args_list[1].kwargs["metadata"]
+        assert boundary_meta.get("expect_edits") is True
+        assert boundary_meta.get("notify") is not True
+        assert final_meta.get("expect_edits") is True
+        assert final_meta.get("notify") is True
+
+    @pytest.mark.asyncio
     async def test_segment_break_no_text_before(self):
         """A None boundary with no preceding text is a no-op."""
         adapter = MagicMock()
