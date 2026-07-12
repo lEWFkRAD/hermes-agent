@@ -9,7 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from plugins.platforms.kindle.adapter import KindleAdapter
+from plugins.platforms.kindle.adapter import DEFAULT_REPLY_TIMEOUT, KindleAdapter
 
 
 def _adapter(monkeypatch: pytest.MonkeyPatch, *, timeout: float = 1.0) -> KindleAdapter:
@@ -34,7 +34,17 @@ async def _wait_for_pending(adapter: KindleAdapter, chat_id: str) -> None:
 
 
 def _payload(chat_id: str = "scribe-1", text: str = "hello") -> dict[str, str]:
-    return {"chat_id": chat_id, "user": "jeff", "text": text}
+    return {"chat_id": chat_id, "user": "kindle-user", "text": text}
+
+
+def test_default_reply_timeout_is_kindle_patient(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KINDLE_INGEST_TOKEN", "test-token")
+    monkeypatch.delenv("KINDLE_REPLY_TIMEOUT", raising=False)
+
+    adapter = KindleAdapter(PlatformConfig(enabled=True, token="", extra={}))
+
+    assert DEFAULT_REPLY_TIMEOUT == 360
+    assert adapter._reply_timeout == 360
 
 
 @pytest.mark.asyncio
@@ -159,5 +169,169 @@ async def test_overlapping_same_chat_request_is_rejected_without_stealing_waiter
     assert sent.success is True
     assert first_response.status == 200
     assert first_body == {"reply": "reply A"}
-    assert dispatched == ["turn A"]
+    assert len(dispatched) == 1
+    assert dispatched[0].endswith("\n\nturn A")
     assert adapter._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_ingest_explains_host_access_and_requires_verified_tool_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter(monkeypatch)
+    dispatched = []
+
+    async def accept(event) -> None:
+        dispatched.append(event.text)
+
+    monkeypatch.setattr(adapter, "handle_message", accept)
+    async with _client(adapter) as client:
+        request = asyncio.create_task(
+            client.post(
+                "/ingest",
+                json=_payload(text="Save this to my desktop"),
+                headers={"X-Kindle-Token": "test-token"},
+            )
+        )
+        await _wait_for_pending(adapter, "scribe-1")
+        await adapter.send("scribe-1", "saved", metadata={"notify": True})
+        response = await request
+
+    assert response.status == 200
+    assert len(dispatched) == 1
+    assert "remote interface to Hermes running on the gateway host" in dispatched[0]
+    assert "tool-enabled Hermes platform" in dispatched[0]
+    assert "not a plain local notebook model" in dispatched[0]
+    assert "perform the action with an available tool and verify its result" in dispatched[0]
+    assert "Do not tell the user this Kindle channel has no tools" in dispatched[0]
+    assert dispatched[0].endswith("\n\nSave this to my desktop")
+
+
+@pytest.mark.asyncio
+async def test_ingest_adds_bridge_intent_tags_ocr_and_live_page_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter(monkeypatch)
+    dispatched = []
+
+    async def accept(event) -> None:
+        dispatched.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", accept)
+    payload = {
+        **_payload(text="Use the markups."),
+        "intent": "tasks",
+        "tags": ["#Client", "todo", "bad tag!", "todo"],
+        "source": "live-page",
+        "artifact_type": "html",
+        "ocr_raw": "pay J Smith $1,OOO",
+        "ocr_cleaned": "pay J. Smith $1,000",
+    }
+    async with _client(adapter) as client:
+        request = asyncio.create_task(
+            client.post("/ingest", json=payload, headers={"X-Kindle-Token": "test-token"})
+        )
+        await _wait_for_pending(adapter, "scribe-1")
+        await adapter.send("scribe-1", "ok", metadata={"notify": True})
+        response = await request
+
+    assert response.status == 200
+    assert len(dispatched) == 1
+    text = dispatched[0].text
+    assert "Intent: tasks." in text
+    assert "Group them by owner, due date, and uncertainty" in text
+    assert "Notebook tags: #client, #todo." in text
+    assert "bad tag" not in text
+    assert "visible HTML replaces the old page" in text
+    assert "raw handwriting transcription was 'pay J Smith $1,OOO'" in text
+    assert "cleaned transcription was 'pay J. Smith $1,000'" in text
+    assert text.endswith("\n\nUse the markups.")
+    assert dispatched[0].raw_message == payload
+
+
+@pytest.mark.asyncio
+async def test_ingest_supports_creative_notebook_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter(monkeypatch)
+    dispatched = []
+
+    async def accept(event) -> None:
+        dispatched.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", accept)
+    payload = {
+        **_payload(text="Turn this sketch into a strange little opening scene."),
+        "intent": "creative",
+        "tags": ["draft", "story"],
+    }
+    async with _client(adapter) as client:
+        request = asyncio.create_task(
+            client.post("/ingest", json=payload, headers={"X-Kindle-Token": "test-token"})
+        )
+        await _wait_for_pending(adapter, "scribe-1")
+        await adapter.send("scribe-1", "ok", metadata={"notify": True})
+        response = await request
+
+    assert response.status == 200
+    assert len(dispatched) == 1
+    text = dispatched[0].text
+    assert "Intent: creative." in text
+    assert "Treat the Kindle as a creative notebook" in text
+    assert "Do not force it into workpaper, task, or business structure" in text
+    assert "Notebook tags: #draft, #story." in text
+    assert text.endswith("\n\nTurn this sketch into a strange little opening scene.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "expected_name"),
+    [
+        ("ipados", "iPadOS notebook"),
+        ("android", "Android stylus notebook"),
+        ("boox", "BOOX notebook"),
+    ],
+)
+async def test_ingest_identifies_supported_stylus_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    expected_name: str,
+) -> None:
+    adapter = _adapter(monkeypatch)
+    dispatched = []
+
+    async def accept(event) -> None:
+        dispatched.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", accept)
+    payload = {
+        **_payload(chat_id=f"{platform}-1"),
+        "client": {
+            "platform": platform,
+            "stylus": "test-pen",
+            "capabilities": ["pressure", "tilt", "bad capability!"],
+        },
+    }
+    async with _client(adapter) as client:
+        request = asyncio.create_task(
+            client.post("/ingest", json=payload, headers={"X-Notebook-Token": "test-token"})
+        )
+        await _wait_for_pending(adapter, f"{platform}-1")
+        await adapter.send(f"{platform}-1", "ok", metadata={"notify": True})
+        response = await request
+
+    assert response.status == 200
+    assert len(dispatched) == 1
+    assert expected_name in dispatched[0].text
+    assert "stylus=test-pen" in dispatched[0].text
+    assert "capabilities=pressure, tilt" in dispatched[0].text
+    assert dispatched[0].source.chat_name == expected_name
+
+
+def test_notebook_token_env_is_preferred(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NOTEBOOK_INGEST_TOKEN", "notebook-token")
+    monkeypatch.setenv("KINDLE_INGEST_TOKEN", "legacy-token")
+
+    adapter = KindleAdapter(PlatformConfig(enabled=True, token="", extra={}))
+
+    assert adapter._token == "notebook-token"

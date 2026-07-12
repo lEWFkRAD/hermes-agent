@@ -1,9 +1,8 @@
-"""Kindle Scribe platform adapter — DRAFT for review.
+"""Kindle Scribe platform adapter.
 
 Bridges the "Hermes Agents Guide to the Galaxy" Scribe notebook into the Hermes
-gateway as a first-class platform, so handwriting/typed notes reach the FULL
-desktop Hermes agent (MoA + tools + memory) — exactly like the Telegram/Discord
-bots. Modeled on plugins/platforms/sms/adapter.py.
+gateway as a first-class platform, so handwriting/typed notes reach the desktop
+Hermes agent through the same message pipeline as Telegram and Discord.
 
 Data flow:
     Kindle browser --(LAN)--> diary bridge (Node) --(localhost HTTP)--> THIS adapter
@@ -20,14 +19,14 @@ Env:
   KINDLE_INGEST_TOKEN     shared secret the bridge must send (X-Kindle-Token); required
                           unless KINDLE_INSECURE=true
   KINDLE_INSECURE         (true) skip the token — localhost dev only
-  KINDLE_ALLOWED_USERS    comma-separated user ids allowed (e.g. "jeff")
+  KINDLE_ALLOWED_USERS    comma-separated user ids allowed (e.g. "kindle-user")
   KINDLE_ALLOW_ALL_USERS  (true/false)
   KINDLE_HOME_CHANNEL     chat id for cron/home delivery
-  KINDLE_REPLY_TIMEOUT    seconds to wait for the agent (default 240)
+  KINDLE_REPLY_TIMEOUT    seconds to wait for the agent (default 360)
 
-STATUS: non-streaming v1 (one request -> one reply). Streaming via send_draft is a
-documented TODO below; the diary already streams to the Kindle, so we can add it
-once the round-trip works.
+This adapter is intentionally request/response for now: one ingest request waits
+for one completed platform reply. The companion bridge can still show local
+progress while the gateway is working.
 """
 
 import asyncio
@@ -47,8 +46,146 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_INGEST_HOST = "127.0.0.1"
 DEFAULT_INGEST_PORT = 8793
-DEFAULT_REPLY_TIMEOUT = 240
+DEFAULT_REPLY_TIMEOUT = 360
 MAX_KINDLE_LENGTH = 8000  # e-ink page; plenty for a notebook reply
+
+NOTEBOOK_CLIENTS = {
+    "kindle": "Kindle Scribe",
+    "scribe": "Kindle Scribe",
+    "ipados": "iPadOS notebook",
+    "ipad": "iPadOS notebook",
+    "ios": "iPadOS notebook",
+    "android": "Android stylus notebook",
+    "boox": "BOOX notebook",
+}
+
+KINDLE_HOST_CONTEXT = (
+    "[Kindle host context: This Kindle is a remote interface to Hermes running on the "
+    "gateway host. This is a tool-enabled Hermes platform, not a plain local notebook "
+    "model. You may use the host's configured tools, files, databases, and services. "
+    "For requests that read, create, save, copy, or change host resources, perform the action "
+    "with an available tool and verify its result before claiming success. Never invent a path "
+    "or claim a resource was accessed or changed without a successful tool result. Do not tell "
+    "the user this Kindle channel has no tools unless the gateway reports an actual tool failure.]"
+)
+
+KINDLE_INTENTS = {
+    "summarize": (
+        "Summarize the current page or note. Start with the answer in one short "
+        "paragraph, then add only the most useful detail."
+    ),
+    "tasks": (
+        "Extract tasks. Group them by owner, due date, and uncertainty. If a task "
+        "is inferred from handwriting, label it inferred."
+    ),
+    "email": (
+        "Draft a concise email from the note or marked page. Do not send it. Put "
+        "the draft first, then a short note about assumptions."
+    ),
+    "creative": (
+        "Treat the Kindle as a creative notebook. Help explore, extend, rewrite, "
+        "or shape the idea in the user's voice. Do not force it into workpaper, "
+        "task, or business structure unless the user asks."
+    ),
+    "workpaper": (
+        "Create a workpaper-ready note: facts, evidence, open items, risks, and "
+        "next action. Keep amounts, dates, and names exact."
+    ),
+}
+
+
+def _clean_tag(value: Any) -> str:
+    tag = str(value or "").strip().lstrip("#").lower()
+    if not tag or len(tag) > 32:
+        return ""
+    return tag if all(ch.isalnum() or ch in "-_" for ch in tag) else ""
+
+
+def _notebook_client(body: Dict[str, Any]) -> tuple[str, str]:
+    """Return a stable client family and user-facing notebook name.
+
+    Existing bridges that omit client metadata remain Kindle Scribe. New
+    clients identify themselves with ``client.platform`` (preferred) or the
+    flat ``device_platform`` compatibility field.
+    """
+    client = body.get("client") if isinstance(body.get("client"), dict) else {}
+    raw_platform = client.get("platform") or body.get("device_platform") or "kindle"
+    platform = str(raw_platform).strip().lower()
+    if platform not in NOTEBOOK_CLIENTS:
+        platform = "kindle"
+    return platform, NOTEBOOK_CLIENTS[platform]
+
+
+def _bridge_context(body: Dict[str, Any]) -> str:
+    """Convert optional companion-bridge metadata into model-visible context.
+
+    The adapter remains transport-only: the bridge owns OCR/UI/progress, and the
+    agent owns tools. These hints make the contract explicit when the bridge has
+    already classified the note or the visible artifact being annotated.
+    """
+
+    lines: list[str] = []
+    platform, client_name = _notebook_client(body)
+    client = body.get("client") if isinstance(body.get("client"), dict) else {}
+    stylus = str(client.get("stylus") or body.get("stylus") or "").strip()
+    capabilities = client.get("capabilities") or body.get("capabilities") or []
+    if isinstance(capabilities, str):
+        capabilities = [item.strip() for item in capabilities.split(",")]
+    clean_capabilities = [
+        value for value in (_clean_tag(item) for item in capabilities)
+        if value
+    ][:12]
+    device_line = f"Notebook client: {client_name} (platform={platform})"
+    if stylus:
+        device_line += f", stylus={stylus[:64]}"
+    if clean_capabilities:
+        device_line += ", capabilities=" + ", ".join(clean_capabilities)
+    lines.append(device_line + ".")
+    intent = str(body.get("intent") or "").strip().lower()
+    if intent in KINDLE_INTENTS:
+        lines.append(f"Intent: {intent}. {KINDLE_INTENTS[intent]}")
+
+    raw_tags = body.get("tags") or []
+    if isinstance(raw_tags, str):
+        raw_tags = [item.strip() for item in raw_tags.split(",")]
+    if isinstance(raw_tags, list):
+        tags = []
+        seen = set()
+        for raw in raw_tags:
+            tag = _clean_tag(raw)
+            if tag and tag not in seen:
+                tags.append(tag)
+                seen.add(tag)
+        if tags:
+            lines.append("Notebook tags: " + ", ".join(f"#{tag}" for tag in tags[:12]) + ".")
+
+    source = str(body.get("source") or "").strip().lower()
+    artifact_type = str(body.get("artifact_type") or "").strip().lower()
+    if source in {"live-page", "artifact", "html"} or artifact_type == "html":
+        lines.append(
+            "Artifact display: the Kindle user is looking at a rendered HTML artifact. "
+            "If you create or revise HTML, use the configured live-page/artifact tools "
+            "so the visible HTML replaces the old page instead of merely describing the change."
+        )
+
+    raw_ocr = str(body.get("ocr_raw") or body.get("raw_transcription") or "").strip()
+    cleaned_ocr = str(body.get("ocr_cleaned") or body.get("cleaned_transcription") or "").strip()
+    if raw_ocr and cleaned_ocr and raw_ocr != cleaned_ocr:
+        lines.append(
+            "OCR uncertainty: raw handwriting transcription was "
+            f"{raw_ocr!r}; cleaned transcription was {cleaned_ocr!r}. If a name, date, "
+            "dollar amount, or command depends on the difference, state the uncertainty "
+            "and likely alternatives."
+        )
+    elif raw_ocr:
+        lines.append(
+            "OCR uncertainty: handwriting may still contain ambiguous names, dates, "
+            "dollar amounts, or arrows. Preserve uncertainty instead of over-committing."
+        )
+
+    if not lines:
+        return ""
+    return "[Kindle bridge context]\n" + "\n".join(lines) + "\n[/Kindle bridge context]"
 
 
 def check_kindle_requirements() -> bool:
@@ -74,7 +211,9 @@ class KindleAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=platform)
         self._host: str = os.getenv("KINDLE_INGEST_HOST", DEFAULT_INGEST_HOST)
         self._port: int = int(os.getenv("KINDLE_INGEST_PORT", str(DEFAULT_INGEST_PORT)))
-        self._token: str = os.getenv("KINDLE_INGEST_TOKEN", "").strip()
+        self._token: str = (
+            os.getenv("NOTEBOOK_INGEST_TOKEN") or os.getenv("KINDLE_INGEST_TOKEN", "")
+        ).strip()
         self._insecure: bool = os.getenv("KINDLE_INSECURE", "").lower() == "true"
         self._reply_timeout: float = float(
             os.getenv("KINDLE_REPLY_TIMEOUT", str(DEFAULT_REPLY_TIMEOUT))
@@ -162,7 +301,10 @@ class KindleAdapter(BasePlatformAdapter):
         from aiohttp import web
 
         if not self._insecure:
-            if request.headers.get("X-Kindle-Token", "") != self._token:
+            supplied_token = request.headers.get("X-Notebook-Token", "") or request.headers.get(
+                "X-Kindle-Token", ""
+            )
+            if supplied_token != self._token:
                 return web.json_response({"error": "unauthorized"}, status=401)
 
         try:
@@ -195,15 +337,22 @@ class KindleAdapter(BasePlatformAdapter):
                 status=409,
             )
 
+        _platform, client_name = _notebook_client(body)
         source = self.build_source(
             chat_id=chat_id,
-            chat_name="Kindle Scribe",
+            chat_name=client_name,
             chat_type="dm",
             user_id=user_id,
             user_name=user_id,
         )
+        bridge_context = _bridge_context(body)
+        context_parts = [KINDLE_HOST_CONTEXT]
+        if bridge_context:
+            context_parts.append(bridge_context)
+        context_text = "\n\n".join(context_parts)
+
         event = MessageEvent(
-            text=text,
+            text=f"{context_text}\n\n{text}",
             message_type=MessageType.TEXT,
             source=source,
             raw_message=body,
@@ -264,12 +413,11 @@ def register(ctx) -> None:
         cron_deliver_env_var="KINDLE_HOME_CHANNEL",
         max_message_length=MAX_KINDLE_LENGTH,
         pii_safe=False,  # this channel CAN reach firm tools — treat as sensitive
-        emoji="✍️",  # ✍️
+        emoji="✍️",
         allow_update_command=True,
     )
 
 
-# TODO (session): streaming. Implement supports_draft_streaming()->True and
-# send_draft(); replace the Future with an asyncio.Queue, have _handle_ingest
-# return a StreamResponse that drains the queue, and have the diary bridge proxy
-# that stream into its existing Kindle streaming protocol.
+# Future extension: implement supports_draft_streaming() and send_draft(), then
+# replace the Future with an asyncio.Queue so _handle_ingest can return a
+# StreamResponse that the companion bridge proxies to the Kindle.
