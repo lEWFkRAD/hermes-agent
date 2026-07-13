@@ -4954,10 +4954,26 @@ class BasePlatformAdapter(ABC):
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
                 # True globally and no ``/voice off`` has been issued.
                 _tts_path = None
+                # A connected Discord voice call may already have spoken the
+                # response sentence-by-sentence from model deltas.  The runner
+                # drops a one-shot chat marker after that queue completes; pop
+                # it here so the legacy whole-response auto-TTS path does not
+                # play the same answer a second time.
+                _sentence_voice_already_played = False
+                _sentence_voice_chats = getattr(
+                    self, "_sentence_voice_completed_chats", None
+                )
+                if _sentence_voice_chats is not None:
+                    try:
+                        _sentence_voice_chats.remove(event.source.chat_id)
+                        _sentence_voice_already_played = True
+                    except KeyError:
+                        pass
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
-                        and not media_files):
+                        and not media_files
+                        and not _sentence_voice_already_played):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
@@ -4976,6 +4992,9 @@ class BasePlatformAdapter(ABC):
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
                 if _tts_path and Path(_tts_path).exists():
+                    _voice_delivery_started = time.monotonic()
+                    _voice_delivery_ok = False
+                    _voice_delivery_error = None
                     try:
                         telegram_tts_caption = None
                         if (
@@ -4993,7 +5012,27 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        _voice_delivery_ok = bool(getattr(tts_result, "success", False))
+                    except Exception as _voice_delivery_exc:
+                        _voice_delivery_error = type(_voice_delivery_exc).__name__
+                        raise
                     finally:
+                        try:
+                            from agent.voice_timing import append_voice_timing
+                            append_voice_timing(
+                                "voice_delivery",
+                                "ok" if _voice_delivery_ok else "error",
+                                platform=str(getattr(self.platform, "value", self.platform)),
+                                mode="auto_tts_file",
+                                chat_id=str(event.source.chat_id),
+                                total_ms=round(
+                                    (time.monotonic() - _voice_delivery_started) * 1000,
+                                    2,
+                                ),
+                                error_type=_voice_delivery_error,
+                            )
+                        except Exception:
+                            pass
                         try:
                             os.remove(_tts_path)
                         except OSError:

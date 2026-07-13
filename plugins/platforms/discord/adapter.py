@@ -2844,6 +2844,76 @@ class DiscordAdapter(BasePlatformAdapter):
                     except OSError:
                         pass
 
+    async def play_tts_text_in_voice(self, guild_id: int, text: str) -> bool:
+        """Synthesize one bounded text segment and play it in the voice channel.
+
+        This is the small, serial building block used by the gateway's
+        sentence queue.  Keeping synthesis here lets the gateway feed the
+        first two sentences as soon as they stream from the model, while
+        ``play_in_voice_channel`` continues to own echo prevention, mixer
+        ducking, playback serialization, and timeouts.
+        """
+        text = (text or "").strip()
+        if not text:
+            return False
+        if not self.is_in_voice_channel(guild_id):
+            return False
+
+        import uuid as _uuid
+        audio_path = os.path.join(
+            tempfile.gettempdir(), "hermes_voice",
+            f"sentence_{_uuid.uuid4().hex[:12]}.wav",
+        )
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        actual = None
+        delivery_started = time.monotonic()
+        delivery_ok = False
+        error_type = None
+        try:
+            from tools.tts_tool import text_to_speech_tool
+
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool, text=text, output_path=audio_path
+            )
+            result = json.loads(result_json)
+            actual = result.get("file_path", audio_path)
+            if not result.get("success") or not os.path.isfile(actual):
+                logger.warning(
+                    "Sentence-queue TTS failed (guild=%d): %s",
+                    guild_id, result.get("error"),
+                )
+                return False
+            delivery_ok = await self.play_in_voice_channel(guild_id, actual)
+            return delivery_ok
+        except Exception as exc:
+            error_type = type(exc).__name__
+            logger.warning(
+                "Sentence-queue voice playback failed (guild=%d): %s",
+                guild_id, exc,
+            )
+            return False
+        finally:
+            try:
+                from agent.voice_timing import append_voice_timing
+                append_voice_timing(
+                    "voice_delivery",
+                    "ok" if delivery_ok else "error",
+                    platform="discord",
+                    mode="sentence_queue",
+                    guild_id=str(guild_id),
+                    text_chars=len(text),
+                    total_ms=round((time.monotonic() - delivery_started) * 1000, 2),
+                    error_type=error_type,
+                )
+            except Exception:
+                pass
+            for path in {audio_path, actual} - {None}:
+                if path and os.path.isfile(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
     def voice_mixer_active(self, guild_id: int) -> bool:
         """True when a continuous mixer is installed for this guild."""
         mixers = getattr(self, "_voice_mixers", None)

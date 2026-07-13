@@ -12100,7 +12100,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if (not agent_result.get("voice_streamed")
+                    and self._should_send_voice_reply(
+                        event, response, agent_messages, already_sent=_already_sent
+                    )):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -13086,6 +13089,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import uuid as _uuid
         audio_path = None
         actual_path = None
+        _voice_delivery_started = None
+        _voice_delivery_ok = False
+        _voice_delivery_error = None
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
@@ -13125,7 +13131,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and hasattr(adapter, "play_in_voice_channel")
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
+                _voice_delivery_started = time.monotonic()
+                _voice_delivery_ok = bool(
+                    await adapter.play_in_voice_channel(guild_id, actual_path)
+                )
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
@@ -13147,14 +13156,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
-                await adapter.send_voice(**send_kwargs)
+                _voice_delivery_started = time.monotonic()
+                _voice_send_result = await adapter.send_voice(**send_kwargs)
+                _voice_delivery_ok = bool(
+                    getattr(_voice_send_result, "success", _voice_send_result)
+                )
         except Exception as e:
+            _voice_delivery_error = type(e).__name__
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
             for p in {audio_path, actual_path} - {None}:
                 try:
                     os.unlink(p)
                 except OSError:
+                    pass
+            if _voice_delivery_started is not None:
+                try:
+                    from agent.voice_timing import append_voice_timing
+                    append_voice_timing(
+                        "voice_delivery",
+                        "ok" if _voice_delivery_ok else "error",
+                        platform=str(getattr(event.source.platform, "value", event.source.platform)),
+                        mode="runner_voice_reply",
+                        chat_id=str(event.source.chat_id),
+                        total_ms=round(
+                            (time.monotonic() - _voice_delivery_started) * 1000,
+                            2,
+                        ),
+                        error_type=_voice_delivery_error,
+                    )
+                except Exception:
                     pass
 
     async def _deliver_media_from_response(
@@ -17144,6 +17175,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
         _voice_ack_loop = asyncio.get_running_loop()
 
+        # Discord conversation voice queue.  This is deliberately gated to a
+        # live mixer-bound voice channel and an explicit config switch; normal
+        # text chats and Telegram voice bubbles retain the completed-file path.
+        # Model deltas are buffered into the first two sentences, then one
+        # sentence at a time, so Hermes can begin speaking while the remainder
+        # of the answer is still being generated.
+        _voice_sentence_loop = _voice_ack_loop
+        _voice_sentence_queue: Optional[asyncio.Queue] = None
+        _voice_sentence_task: Optional[asyncio.Task] = None
+        _voice_sentence_finish_sent = [False]
+        _voice_sentence_attempted = [False]
+        _voice_sentence_played = [False]
+        _voice_cfg = user_config.get("voice") or {}
+        _voice_mode_for_chat = self._voice_mode.get(
+            self._voice_key(source.platform, source.chat_id), "off"
+        )
+        _voice_sentence_adapter = self.adapters.get(Platform.DISCORD)
+        _voice_sentence_enabled = bool(
+            _voice_ack_guild[0] is not None
+            and _voice_mode_for_chat in {"all", "voice_only"}
+            and bool(_voice_cfg.get("discord_sentence_queue", False))
+            and _voice_sentence_adapter is not None
+            and hasattr(_voice_sentence_adapter, "play_tts_text_in_voice")
+        )
+
+        if _voice_sentence_enabled:
+            from gateway.voice_sentence_queue import VoiceSentenceChunker
+
+            _voice_sentence_queue = asyncio.Queue()
+
+            async def _consume_voice_sentences() -> None:
+                chunker = VoiceSentenceChunker(
+                    first_sentences=int(
+                        _voice_cfg.get("sentence_queue_first_sentences", 2) or 2
+                    ),
+                    later_sentences=int(
+                        _voice_cfg.get("sentence_queue_later_sentences", 1) or 1
+                    ),
+                    max_chars=int(_voice_cfg.get("sentence_queue_max_chars", 600) or 600),
+                )
+                while True:
+                    delta = await _voice_sentence_queue.get()
+                    chunks = chunker.finish() if delta is None else chunker.feed(delta)
+                    for speech_chunk in chunks:
+                        if not _run_still_current():
+                            return
+                        _voice_sentence_attempted[0] = True
+                        started = time.monotonic()
+                        ok = await _voice_sentence_adapter.play_tts_text_in_voice(
+                            _voice_ack_guild[0], speech_chunk
+                        )
+                        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+                        if ok:
+                            _voice_sentence_played[0] = True
+                        logger.info(
+                            "Discord sentence voice chunk: guild=%s chars=%d "
+                            "elapsed_ms=%.1f success=%s",
+                            _voice_ack_guild[0], len(speech_chunk), elapsed_ms, ok,
+                        )
+                    if delta is None:
+                        return
+
+            _voice_sentence_task = asyncio.create_task(_consume_voice_sentences())
+
+        def _finish_voice_sentence_queue() -> None:
+            if _voice_sentence_queue is None or _voice_sentence_finish_sent[0]:
+                return
+            _voice_sentence_finish_sent[0] = True
+            try:
+                _voice_sentence_loop.call_soon_threadsafe(
+                    _voice_sentence_queue.put_nowait, None
+                )
+            except RuntimeError:
+                pass
+
         def voice_ack_callback(call_id, tool_name, args):
             """tool_start_callback: speak a one-time ack in the voice channel."""
             if _voice_ack_fired[0] or _voice_ack_guild[0] is None:
@@ -17999,7 +18105,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
+            # Voice sentence playback also needs model deltas even when the
+            # Discord text surface has streaming edits disabled.
+            _want_stream_deltas = _streaming_enabled or _voice_sentence_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
@@ -18064,8 +18172,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
-                                if _run_still_current():
+                                if not _run_still_current():
+                                    return
+                                if _streaming_enabled and _stream_consumer is not None:
                                     _stream_consumer.on_delta(text)
+                                if _voice_sentence_queue is not None:
+                                    try:
+                                        _voice_sentence_loop.call_soon_threadsafe(
+                                            _voice_sentence_queue.put_nowait, text
+                                        )
+                                    except RuntimeError:
+                                        pass
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -18867,6 +18984,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
+            _finish_voice_sentence_queue()
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
@@ -19907,6 +20025,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
+            # Flush and drain any active Discord sentence queue before this
+            # turn's local state is released.  Text delivery may already have
+            # completed; this wait only serializes the remaining spoken
+            # sentence clips and prevents a later turn from talking over them.
+            _finish_voice_sentence_queue()
+            if _voice_sentence_task is not None:
+                try:
+                    await asyncio.wait_for(_voice_sentence_task, timeout=600.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    _voice_sentence_task.cancel()
+                except Exception as _voice_sentence_exc:
+                    logger.warning(
+                        "Discord sentence voice queue failed: %s",
+                        _voice_sentence_exc,
+                    )
+
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
                 progress_task.cancel()
@@ -19964,6 +20098,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await task
                     except asyncio.CancelledError:
                         pass
+
+        # A successful sentence queue owns voice delivery for this turn.  Mark
+        # the result for the runner-level whole-response gate and leave a
+        # one-shot marker for BasePlatformAdapter's legacy voice-input auto-TTS
+        # gate.  If every sentence failed, neither marker is set and the normal
+        # completed-file fallback still runs.
+        if isinstance(response, dict) and _voice_sentence_played[0]:
+            response["voice_streamed"] = True
+            if _voice_sentence_adapter is not None:
+                _spoken_chats = getattr(
+                    _voice_sentence_adapter,
+                    "_sentence_voice_completed_chats",
+                    None,
+                )
+                if _spoken_chats is None:
+                    _spoken_chats = set()
+                    _voice_sentence_adapter._sentence_voice_completed_chats = _spoken_chats
+                _spoken_chats.add(source.chat_id)
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
