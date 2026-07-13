@@ -29,6 +29,8 @@ snapshot stream for notebook clients that can render incremental responses.
 """
 
 import asyncio
+import contextlib
+import hmac
 import json
 import logging
 import os
@@ -48,6 +50,11 @@ DEFAULT_INGEST_HOST = "127.0.0.1"
 DEFAULT_INGEST_PORT = 8793
 DEFAULT_REPLY_TIMEOUT = 360
 MAX_KINDLE_LENGTH = 8000  # e-ink page; plenty for a notebook reply
+
+# Queue sentinel: disconnect() enqueues this so streaming handlers blocked on
+# stream_queue.get() wake up and end their responses instead of holding the
+# aiohttp runner open for the full reply timeout during shutdown.
+_SHUTDOWN = object()
 
 NOTEBOOK_CLIENTS = {
     "kindle": "Kindle Scribe",
@@ -206,9 +213,11 @@ class KindleAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = MAX_KINDLE_LENGTH
     SUPPORTS_MESSAGE_EDITING = True
-    # Once the HTTP request closes there is no outbound channel for a detached
-    # tool or subagent result.  Keep that work inside the active turn so the
-    # completed result is part of the reply the Kindle actually receives.
+    # The finalize=True edit is what resolves the pending ingest request, so it
+    # must be delivered even when its content matches the last streamed edit —
+    # otherwise the skip-if-same path marks the turn delivered while the HTTP
+    # request waits out the full reply timeout.
+    REQUIRES_EDIT_FINALIZE = True
     supports_async_delivery = False
 
     def __init__(self, config: PlatformConfig):
@@ -262,6 +271,11 @@ class KindleAdapter(BasePlatformAdapter):
             if not fut.done():
                 fut.cancel()
         self._pending.clear()
+        # Cancelled futures only wake the legacy JSON path; streaming handlers
+        # block on their queue, so each one needs the shutdown sentinel or
+        # runner.cleanup() below waits on them until the reply timeout.
+        for queue in list(self._stream_queues.values()):
+            queue.put_nowait(_SHUTDOWN)
         self._stream_queues.clear()
         if self._runner:
             await self._runner.cleanup()
@@ -305,7 +319,14 @@ class KindleAdapter(BasePlatformAdapter):
         logger.warning("[kindle] send() for %s had no pending request", chat_id)
         return SendResult(success=False, error="no pending Kindle request")
 
-    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
         """Stream an updated cumulative snapshot to an open ingest response."""
         fut = self._pending.get(chat_id)
         stream_queue = self._stream_queues.get(chat_id)
@@ -330,7 +351,9 @@ class KindleAdapter(BasePlatformAdapter):
             supplied_token = request.headers.get("X-Notebook-Token", "") or request.headers.get(
                 "X-Kindle-Token", ""
             )
-            if supplied_token != self._token:
+            # An unset token must never authorize ("" == "" would); connect()
+            # refuses to start without one, but the handler enforces it too.
+            if not self._token or not hmac.compare_digest(supplied_token, self._token):
                 return web.json_response({"error": "unauthorized"}, status=401)
 
         try:
@@ -386,7 +409,7 @@ class KindleAdapter(BasePlatformAdapter):
             message_id=message_id,
         )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: "asyncio.Future[str]" = loop.create_future()
         self._pending[chat_id] = fut
         stream_queue = None
@@ -402,20 +425,47 @@ class KindleAdapter(BasePlatformAdapter):
 
         try:
             if stream_queue is not None:
-                response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+                response = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "application/x-ndjson; charset=utf-8",
+                        "Cache-Control": "no-store",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
                 await response.prepare(request)
                 while True:
                     try:
-                        content, final = await asyncio.wait_for(stream_queue.get(), timeout=self._reply_timeout)
+                        item = await asyncio.wait_for(
+                            stream_queue.get(), timeout=self._reply_timeout
+                        )
                     except asyncio.TimeoutError:
-                        await response.write((json.dumps({"type": "error", "error": "agent timed out"}) + "\n").encode("utf-8"))
+                        await response.write(
+                            (json.dumps({"type": "error", "error": "agent timed out"}) + "\n").encode("utf-8")
+                        )
                         await response.write_eof()
                         return response
                     except asyncio.CancelledError:
-                        await response.write((json.dumps({"type": "error", "error": "cancelled"}) + "\n").encode("utf-8"))
-                        await response.write_eof()
+                        # Task cancellation (client gone, server stopping) must
+                        # propagate; the error frame is best-effort because the
+                        # transport may already be closed.
+                        with contextlib.suppress(Exception):
+                            await response.write(
+                                (json.dumps({"type": "error", "error": "cancelled"}) + "\n").encode("utf-8")
+                            )
+                            await response.write_eof()
+                        raise
+                    if item is _SHUTDOWN:
+                        with contextlib.suppress(Exception):
+                            await response.write(
+                                (json.dumps({"type": "error", "error": "gateway shutting down"}) + "\n").encode("utf-8")
+                            )
+                            await response.write_eof()
                         return response
-                    await response.write((json.dumps({"type": "snapshot", "text": content, "final": final}) + "\n").encode("utf-8"))
+                    content, final = item
+                    await response.write(
+                        (json.dumps({"type": "snapshot", "text": content, "final": final}) + "\n").encode("utf-8")
+                    )
                     if final:
                         await response.write_eof()
                         return response
@@ -426,11 +476,14 @@ class KindleAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             return web.json_response({"error": "cancelled"}, status=503)
         finally:
-            # Only remove our own waiter. This identity guard keeps cleanup
-            # correct if the lifecycle changes to queues or retries later.
+            # Only remove our own waiter/queue. The identity guards matter: a
+            # new request for the same chat can register between this request
+            # finishing and this finally running, and an unguarded pop would
+            # strand that request waiting on a queue nothing can find.
             if self._pending.get(chat_id) is fut:
                 self._pending.pop(chat_id, None)
-            self._stream_queues.pop(chat_id, None)
+            if stream_queue is not None and self._stream_queues.get(chat_id) is stream_queue:
+                self._stream_queues.pop(chat_id, None)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -444,7 +497,7 @@ def _is_connected(config) -> bool:
     return bool(
         os.getenv("NOTEBOOK_INGEST_TOKEN")
         or os.getenv("KINDLE_INGEST_TOKEN")
-        or os.getenv("KINDLE_INSECURE")
+        or os.getenv("KINDLE_INSECURE", "").lower() == "true"
     )
 
 
