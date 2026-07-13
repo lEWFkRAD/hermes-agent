@@ -118,7 +118,7 @@ page.
 The `workpaper` intent is only one mode. For open-ended sketches, fiction,
 poetry, product concepts, personal notes, or "what does this make you think of?"
 turns, the bridge should send `creative` or omit `intent` entirely so the agent
-can interpret the note without narrowing it to Bearden or business workflows.
+can interpret the note without narrowing it to firm or business workflows.
 
 ## Remote-access security boundary
 

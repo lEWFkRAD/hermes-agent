@@ -1,4 +1,4 @@
-# BOOX tester guide (Mac Swan)
+# BOOX tester guide
 
 Thank you for testing Hermes Notebook. This is an early debug build: use a
 non-critical notebook page and do not enter secrets into screenshots or bug reports.
@@ -124,7 +124,7 @@ work against an ordinary Hermes checkout that does not contain
    tailscale serve status
    ```
 
-7. Give Mac the printed private HTTPS URL and token through a private channel.
+7. Give the tester the printed private HTTPS URL and token through a private channel.
    Grant only his BOOX identity/device access in the Tailscale policy. Do not use
    Tailscale Funnel and do not open port 8793 on the router or firewall.
 
