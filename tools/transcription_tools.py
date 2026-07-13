@@ -1225,11 +1225,16 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             if prep_error:
                 return {"success": False, "transcript": "", "error": prep_error}
 
+            def _command_quote(value: str) -> str:
+                if os.name == "nt":
+                    return subprocess.list2cmdline([value])
+                return shlex.quote(value)
+
             command = command_template.format(
-                input_path=shlex.quote(prepared_input),
-                output_dir=shlex.quote(output_dir),
-                language=shlex.quote(language),
-                model=shlex.quote(normalized_model),
+                input_path=_command_quote(prepared_input),
+                output_dir=_command_quote(output_dir),
+                language=_command_quote(language),
+                model=_command_quote(normalized_model),
             )
             # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
             use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())

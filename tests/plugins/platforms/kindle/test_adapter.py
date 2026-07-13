@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -47,6 +48,14 @@ def test_default_reply_timeout_is_kindle_patient(monkeypatch: pytest.MonkeyPatch
     assert adapter._reply_timeout == 360
 
 
+def test_adapter_advertises_request_scoped_message_editing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter(monkeypatch)
+    assert adapter.SUPPORTS_MESSAGE_EDITING is True
+    assert adapter.supports_async_delivery is False
+
+
 @pytest.mark.asyncio
 async def test_ingest_rejects_invalid_token(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _adapter(monkeypatch)
@@ -87,6 +96,39 @@ async def test_final_notify_delivers_reply_not_preview(monkeypatch: pytest.Monke
     assert delivered.success is True
     assert response.status == 200
     assert body == {"reply": "finished"}
+    assert adapter._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_streaming_ingest_emits_editable_snapshots_until_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter(monkeypatch)
+
+    async def accept(_event) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "handle_message", accept)
+    payload = {**_payload(), "stream": True}
+    async with _client(adapter) as client:
+        request = asyncio.create_task(client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-Kindle-Token": "test-token", "Accept": "application/x-ndjson"},
+        ))
+        await _wait_for_pending(adapter, "scribe-1")
+        preview = await adapter.send("scribe-1", "work", metadata={"notify": False})
+        edited = await adapter.edit_message("scribe-1", "scribe-1", "working", finalize=False)
+        final = await adapter.edit_message("scribe-1", "scribe-1", "finished", finalize=True)
+        response = await request
+        frames = [json.loads(line) for line in (await response.text()).splitlines()]
+
+    assert preview.success and edited.success and final.success
+    assert frames == [
+        {"type": "snapshot", "text": "work", "final": False},
+        {"type": "snapshot", "text": "working", "final": False},
+        {"type": "snapshot", "text": "finished", "final": True},
+    ]
     assert adapter._pending == {}
 
 

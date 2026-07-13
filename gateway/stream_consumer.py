@@ -1760,7 +1760,13 @@ class GatewayStreamConsumer:
                     content=text,
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
-                        final=finalize,
+                        # A tool-boundary segment is finalized so the next
+                        # segment can start cleanly, but it is not the final
+                        # answer for the turn.  Marking that preamble as
+                        # notify-worthy makes synchronous adapters (Kindle)
+                        # close their pending request while the agent is still
+                        # running tools.
+                        final=(finalize and is_turn_final),
                         expect_edits=True,
                     ),
                 )
