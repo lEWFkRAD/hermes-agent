@@ -142,6 +142,26 @@ class TestInitialReplyToId:
         metadata = adapter.send.call_args[1]["metadata"]
         assert metadata == {"thread_id": "root_post_123", "expect_edits": True}
 
+    @pytest.mark.asyncio
+    async def test_tool_boundary_first_send_does_not_mark_notify(self):
+        """Closing a pre-tool segment must not masquerade as the turn final."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"thread_id": "root_post_123"},
+            initial_reply_to_id="reply_post_456",
+        )
+
+        await consumer._send_or_edit(
+            "I will look that up.",
+            finalize=True,
+            is_turn_final=False,
+        )
+
+        metadata = adapter.send.call_args[1]["metadata"]
+        assert metadata == {"thread_id": "root_post_123", "expect_edits": True}
+
 
 class TestOverflowFirstMessage:
     """Verify thread routing is preserved when the first message overflows."""

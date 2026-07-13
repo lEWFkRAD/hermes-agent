@@ -48,6 +48,15 @@ def test_default_reply_timeout_is_kindle_patient(monkeypatch: pytest.MonkeyPatch
     assert adapter._reply_timeout == 360
 
 
+def test_adapter_advertises_request_scoped_message_editing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter(monkeypatch)
+    assert adapter.SUPPORTS_MESSAGE_EDITING is True
+    assert adapter.REQUIRES_EDIT_FINALIZE is True
+    assert adapter.supports_async_delivery is False
+
+
 @pytest.mark.asyncio
 async def test_ingest_rejects_invalid_token(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _adapter(monkeypatch)
@@ -122,6 +131,108 @@ async def test_streaming_ingest_emits_editable_snapshots_until_final(
         {"type": "snapshot", "text": "finished", "final": True},
     ]
     assert adapter._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_stream_cleanup_does_not_steal_successor_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Request A's teardown must not pop request B's freshly registered queue.
+
+    Freezes A inside write_eof so B can register for the same chat while A's
+    ``finally`` has not yet run — the exact window where an unguarded pop
+    strands B waiting on a queue nothing can find.
+    """
+    adapter = _adapter(monkeypatch)
+
+    async def accept(_event) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "handle_message", accept)
+
+    release = asyncio.Event()
+    orig_write_eof = web.StreamResponse.write_eof
+
+    async def slow_write_eof(self, *args, **kwargs):
+        await release.wait()
+        return await orig_write_eof(self, *args, **kwargs)
+
+    monkeypatch.setattr(web.StreamResponse, "write_eof", slow_write_eof)
+
+    payload = {**_payload(), "stream": True}
+    headers = {"X-Kindle-Token": "test-token", "Accept": "application/x-ndjson"}
+    async with _client(adapter) as client:
+        request_a = asyncio.create_task(client.post("/ingest", json=payload, headers=headers))
+        await _wait_for_pending(adapter, "scribe-1")
+        queue_a = adapter._stream_queues["scribe-1"]
+
+        # A's final frame is written, then A blocks in write_eof before its finally.
+        await adapter.edit_message("scribe-1", "scribe-1", "answer A", finalize=True)
+        request_b = asyncio.create_task(client.post("/ingest", json=payload, headers=headers))
+        for _ in range(100):
+            current = adapter._stream_queues.get("scribe-1")
+            if current is not None and current is not queue_a:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("request B never registered its stream queue")
+
+        release.set()
+        response_a = await request_a
+
+        # With the guarded pop, B's queue survives A's teardown and B completes.
+        final_b = await adapter.edit_message("scribe-1", "scribe-1", "answer B", finalize=True)
+        response_b = await request_b
+        frames_b = [json.loads(line) for line in (await response_b.text()).splitlines()]
+
+    assert response_a.status == 200
+    assert final_b.success
+    assert frames_b == [{"type": "snapshot", "text": "answer B", "final": True}]
+    assert adapter._pending == {}
+    assert adapter._stream_queues == {}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_ends_open_stream_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown must wake a handler blocked on its stream queue, not wait out
+    the reply timeout."""
+    adapter = _adapter(monkeypatch, timeout=30.0)
+
+    async def accept(_event) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "handle_message", accept)
+    payload = {**_payload(), "stream": True}
+    async with _client(adapter) as client:
+        request = asyncio.create_task(client.post(
+            "/ingest",
+            json=payload,
+            headers={"X-Kindle-Token": "test-token", "Accept": "application/x-ndjson"},
+        ))
+        await _wait_for_pending(adapter, "scribe-1")
+        await adapter.disconnect()
+        response = await asyncio.wait_for(request, timeout=1.0)
+        frames = [json.loads(line) for line in (await response.text()).splitlines()]
+
+    assert frames == [{"type": "error", "error": "gateway shutting down"}]
+    assert adapter._stream_queues == {}
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_missing_token_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty configured token must never authorize an empty supplied token."""
+    monkeypatch.delenv("NOTEBOOK_INGEST_TOKEN", raising=False)
+    monkeypatch.delenv("KINDLE_INGEST_TOKEN", raising=False)
+    monkeypatch.delenv("KINDLE_INSECURE", raising=False)
+    adapter = KindleAdapter(PlatformConfig(enabled=True, token="", extra={}))
+    async with _client(adapter) as client:
+        response = await client.post("/ingest", json=_payload())
+
+    assert response.status == 401
 
 
 @pytest.mark.asyncio
