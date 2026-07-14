@@ -169,10 +169,19 @@ class TestFromGlobalConfig:
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.session_strategy == "per-directory"
 
-    def test_context_tokens_default_is_none(self, tmp_path):
-        """Default context_tokens should be None (uncapped) unless explicitly set."""
+    def test_context_tokens_defaults_to_budget(self, tmp_path):
+        """Unset context_tokens defaults to a real budget — uncapped injection
+        let one oversized observation dump ride into every turn's prompt."""
+        from plugins.memory.honcho.client import _DEFAULT_CONTEXT_TOKENS
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({"apiKey": "***"}))
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+        assert config.context_tokens == _DEFAULT_CONTEXT_TOKENS
+
+    def test_context_tokens_zero_opts_out(self, tmp_path):
+        """Explicit contextTokens: 0 disables the cap (uncapped)."""
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({"apiKey": "***", "contextTokens": 0}))
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.context_tokens is None
 

@@ -273,7 +273,7 @@ Host key is derived from the active Hermes profile: `hermes` (default) or `herme
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `contextTokens` | int | SDK default | Token budget for `context()` API calls. Also gates prefetch truncation (tokens × 4 chars) |
+| `contextTokens` | int | `2000` | Token budget for `context()` API calls. Also gates prefetch truncation (tokens × 4 chars). Set `0` (or negative) to disable the cap |
 | `messageMaxChars` | int | `25000` | Max chars per message sent via `add_messages()`. Exceeding this triggers chunking with `[continued]` markers. Honcho cloud limit: 25k |
 
 ### Cadence (Cost Control)

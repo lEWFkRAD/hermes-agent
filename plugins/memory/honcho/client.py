@@ -123,15 +123,26 @@ def _resolve_bool(*vals, default: bool) -> bool:
     return default
 
 
+# Default injection budget. Uncapped injection (the old default) lets one
+# oversized session summary or observation dump ride into every turn's
+# prompt; 2000 tokens (~8000 chars) comfortably fits a summary + trimmed
+# representation. Set contextTokens to 0 (or negative) to disable the cap.
+_DEFAULT_CONTEXT_TOKENS = 2000
+
+
 def _parse_context_tokens(host_val, root_val) -> int | None:
-    """Parse contextTokens: host wins, then root, then None (uncapped)."""
+    """Parse contextTokens: host wins, then root, then 2000.
+
+    Explicit 0 or negative disables the cap (returns None = uncapped).
+    """
     for val in (host_val, root_val):
         if val is not None:
             try:
-                return int(val)
+                parsed = int(val)
             except (ValueError, TypeError):
-                pass
-    return None
+                continue
+            return parsed if parsed > 0 else None
+    return _DEFAULT_CONTEXT_TOKENS
 
 
 def _parse_int_config(host_val, root_val, default: int) -> int:
@@ -322,8 +333,8 @@ class HonchoClientConfig:
     # Write frequency: "async" (background thread), "turn" (sync per turn),
     # "session" (flush on session end), or int (every N turns)
     write_frequency: str | int = "async"
-    # Prefetch budget (None = no cap; set to an integer to bound auto-injected context)
-    context_tokens: int | None = None
+    # Prefetch budget (None = no cap; contextTokens: 0 in config opts out)
+    context_tokens: int | None = _DEFAULT_CONTEXT_TOKENS
     # Dialectic (peer.chat) settings
     # reasoning_level: "minimal" | "low" | "medium" | "high" | "max"
     dialectic_reasoning_level: str = "low"

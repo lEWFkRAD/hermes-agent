@@ -231,6 +231,11 @@ class HonchoMemoryProvider(MemoryProvider):
         self._reasoning_level_cap: str = "high"  # ceiling for auto-selected level
         self._last_context_turn = -999
         self._last_dialectic_turn = -999
+        # Last non-trivial user query, reused as search_query when the current
+        # turn has no semantic signal (image-only message, init prewarm).
+        # Calling peer.context() without a search_query returns the peer's
+        # FULL observation dump — see _semantic_query().
+        self._last_semantic_query = ""
 
         # Liveness + observability state
         self._prefetch_thread_started_at: float = 0.0   # monotonic ts of current thread
@@ -478,7 +483,7 @@ class HonchoMemoryProvider(MemoryProvider):
         # consumes the result directly.
         if self._recall_mode in {"context", "hybrid"}:
             try:
-                self._manager.prefetch_context(self._session_key)
+                self._manager.prefetch_context(self._session_key, self._semantic_query())
             except Exception as e:
                 logger.debug("Honcho context prewarm failed: %s", e)
 
@@ -674,7 +679,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._base_context_cache = ""
                 self._last_context_turn = self._turn_count
                 try:
-                    self._manager.prefetch_context(self._session_key, query or None)
+                    self._manager.prefetch_context(self._session_key, self._semantic_query(query))
                 except Exception as e:
                     logger.debug("Honcho base context prefetch failed: %s", e)
             base_context = self._base_context_cache
@@ -816,7 +821,7 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._context_cadence <= 1 or (self._turn_count - self._last_context_turn) >= self._context_cadence:
             self._last_context_turn = self._turn_count
             try:
-                self._manager.prefetch_context(self._session_key, query)
+                self._manager.prefetch_context(self._session_key, self._semantic_query(query))
             except Exception as e:
                 logger.debug("Honcho context prefetch failed: %s", e)
 
@@ -1104,6 +1109,29 @@ class HonchoMemoryProvider(MemoryProvider):
         if cls._TRIVIAL_PROMPT_RE.match(stripped):
             return True
         return False
+
+    # Neutral profile query used when no user query is available yet (init
+    # prewarm, or an image-only first message). Keeps peer.context() calls
+    # filtered — an unfiltered call returns the full observation dump.
+    _PROFILE_FALLBACK_QUERY = (
+        "User preferences, current projects, and working style."
+    )
+
+    def _semantic_query(self, query: str | None = None) -> str:
+        """Return the best available search_query for a context fetch.
+
+        Honcho's ``peer.context(search_query=...)`` returns conclusions
+        relevant to the query; calling it WITHOUT a search_query returns the
+        peer's full observation dump, which can be hundreds of entries and
+        swamps the injected context. This helper guarantees every fetch is
+        filtered: use the current query when it carries semantic signal,
+        else fall back to the last one that did, else to a neutral
+        profile query.
+        """
+        if query and not self._is_trivial_prompt(query):
+            self._last_semantic_query = query.strip()
+            return self._last_semantic_query
+        return self._last_semantic_query or self._PROFILE_FALLBACK_QUERY
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Track turn count for cadence and injection_frequency logic."""
