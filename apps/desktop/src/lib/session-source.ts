@@ -8,7 +8,9 @@ const SOURCE_LABELS: Record<string, string> = {
   desktop: 'Desktop',
   discord: 'Discord',
   email: 'Email',
+  excel: 'Excel',
   gateway: 'Gateway',
+  kindle: 'Kindle',
   local: 'Local',
   matrix: 'Matrix',
   mattermost: 'Mattermost',
@@ -47,6 +49,8 @@ const LOCAL_SOURCE_IDS = new Set(LOCAL_SESSION_SOURCE_IDS)
 // section (fetched separately from local recents). Mirrors the gateway platform
 // adapters; keep in sync with PLATFORM_ICONS in app/messaging/platform-icon.tsx.
 export const MESSAGING_SESSION_SOURCE_IDS = [
+  'kindle',
+  'excel',
   'telegram',
   'discord',
   'slack',
