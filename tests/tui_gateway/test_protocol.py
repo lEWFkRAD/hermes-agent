@@ -1183,6 +1183,194 @@ def test_lease_idle_release_seconds_defaults_and_coerces(server, monkeypatch):
     assert server._lease_idle_release_seconds() == 45.0
 
 
+class _FakeLeaseTimer:
+    created = []
+
+    def __init__(self, interval, function):
+        self.interval = interval
+        self.function = function
+        self.cancelled = False
+        self.started = False
+        self.daemon = False
+        self.__class__.created.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.function()
+
+
+class _CountingLease:
+    def __init__(self):
+        self.release_count = 0
+
+    def release(self):
+        self.release_count += 1
+
+
+def test_schedule_idle_lease_release_uses_exact_delay_and_keeps_session_live(
+    server, monkeypatch
+):
+    _FakeLeaseTimer.created = []
+    monkeypatch.setattr(server, "_LeaseTimer", _FakeLeaseTimer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"tui_lease_idle_seconds": 7})
+    lease = _CountingLease()
+    session = _lease_test_session(active_session_lease=lease)
+    server._sessions["ui-idle"] = session
+
+    server._schedule_idle_lease_release("ui-idle", session)
+
+    timer = _FakeLeaseTimer.created[-1]
+    assert timer.interval == 7
+    assert timer.started is True
+    assert timer.daemon is True
+    timer.fire()
+
+    assert lease.release_count == 1
+    assert session.get("active_session_lease") is None
+    assert session.get("_lease_idle_timer") is None
+    assert server._sessions["ui-idle"] is session
+
+
+@pytest.mark.parametrize("protected", ["running", "queued", "pending", "building"])
+def test_idle_lease_timer_rechecks_protected_work_before_release(
+    server, monkeypatch, protected
+):
+    _FakeLeaseTimer.created = []
+    monkeypatch.setattr(server, "_LeaseTimer", _FakeLeaseTimer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"tui_lease_idle_seconds": 7})
+    lease = _CountingLease()
+    session = _lease_test_session(active_session_lease=lease)
+    server._sessions["ui-protected"] = session
+    server._schedule_idle_lease_release("ui-protected", session)
+    timer = _FakeLeaseTimer.created[-1]
+
+    if protected == "running":
+        session["running"] = True
+    elif protected == "queued":
+        session["queued_prompt"] = {"text": "next"}
+    elif protected == "pending":
+        server._pending["pending-idle-release"] = ("ui-protected", None)
+    else:
+        session["agent_ready"] = threading.Event()
+        session["lazy"] = False
+
+    try:
+        timer.fire()
+        assert lease.release_count == 0
+        assert session.get("active_session_lease") is lease
+        assert session.get("_lease_idle_timer") is None
+    finally:
+        server._pending.pop("pending-idle-release", None)
+
+
+def test_turn_start_invalidates_older_idle_lease_timer(server, monkeypatch):
+    _FakeLeaseTimer.created = []
+    monkeypatch.setattr(server, "_LeaseTimer", _FakeLeaseTimer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"tui_lease_idle_seconds": 7})
+    lease = _CountingLease()
+    session = _lease_test_session(active_session_lease=lease)
+
+    server._schedule_idle_lease_release("ui-reuse", session)
+    timer = _FakeLeaseTimer.created[-1]
+    assert server._ensure_turn_lease("ui-reuse", session) is None
+
+    assert timer.cancelled is True
+    assert session.get("_lease_idle_timer") is None
+    timer.fire()
+    assert lease.release_count == 0
+    assert session.get("active_session_lease") is lease
+
+
+def test_turn_start_waits_for_atomic_idle_registry_release(server, monkeypatch):
+    _FakeLeaseTimer.created = []
+    monkeypatch.setattr(server, "_LeaseTimer", _FakeLeaseTimer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"tui_lease_idle_seconds": 7})
+    release_entered = threading.Event()
+    allow_release = threading.Event()
+    release_done = threading.Event()
+
+    class BlockingLease:
+        def release(self):
+            release_entered.set()
+            assert allow_release.wait(timeout=2)
+            release_done.set()
+
+    replacement = _CountingLease()
+
+    def claim(*_args, **_kwargs):
+        if not release_done.is_set():
+            return None, "old registry lease still occupies the only slot"
+        return replacement, None
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", claim)
+    session = _lease_test_session(active_session_lease=BlockingLease())
+    server._schedule_idle_lease_release("ui-race", session)
+    timer = _FakeLeaseTimer.created[-1]
+
+    release_thread = threading.Thread(target=timer.fire)
+    release_thread.start()
+    assert release_entered.wait(timeout=2)
+
+    result = {}
+    turn_thread = threading.Thread(
+        target=lambda: result.setdefault("limit", server._ensure_turn_lease("ui-race", session))
+    )
+    turn_thread.start()
+    turn_thread.join(timeout=0.05)
+    assert turn_thread.is_alive(), "turn admission raced ahead of registry release"
+
+    allow_release.set()
+    release_thread.join(timeout=2)
+    turn_thread.join(timeout=2)
+    assert result["limit"] is None
+    assert session["active_session_lease"] is replacement
+
+
+def test_active_slot_release_cancels_idle_lease_timer(server, monkeypatch):
+    _FakeLeaseTimer.created = []
+    monkeypatch.setattr(server, "_LeaseTimer", _FakeLeaseTimer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"tui_lease_idle_seconds": 7})
+    lease = _CountingLease()
+    session = _lease_test_session(active_session_lease=lease)
+
+    server._schedule_idle_lease_release("ui-close", session)
+    timer = _FakeLeaseTimer.created[-1]
+    server._release_active_session_slot(session)
+
+    assert timer.cancelled is True
+    assert lease.release_count == 1
+    timer.fire()
+    assert lease.release_count == 1
+
+
+def test_queued_dispatch_failure_still_schedules_idle_lease_release(server, monkeypatch):
+    session = _lease_test_session(
+        active_session_lease=_CountingLease(),
+        queued_prompt={"text": "next", "transport": None},
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("dispatch failed")),
+    )
+    monkeypatch.setattr(
+        server,
+        "_schedule_idle_lease_release",
+        lambda sid, current: scheduled.append((sid, current)),
+    )
+
+    assert server._drain_queued_prompt("rid", "ui-queued-failure", session) is True
+    assert session["running"] is False
+    assert session["queued_prompt"] is None
+    assert scheduled == [("ui-queued-failure", session)]
+
+
 def test_session_resume_live_payload_uses_current_history_with_ancestors(server, monkeypatch):
     """Live resume should not reuse a stale ancestor-inclusive snapshot."""
 

@@ -37,6 +37,29 @@ from tui_gateway.transport import (
 )
 
 logger = logging.getLogger(__name__)
+_LeaseThread = threading.Thread
+
+
+class _LeaseTimer:
+    """Small cancellable timer insulated from runtime Thread monkeypatches."""
+
+    def __init__(self, interval: float, function) -> None:
+        self.interval = interval
+        self.function = function
+        self.daemon = False
+        self._cancelled = threading.Event()
+        self._thread = None
+
+    def _run(self) -> None:
+        if not self._cancelled.wait(self.interval):
+            self.function()
+
+    def start(self) -> None:
+        self._thread = _LeaseThread(target=self._run, daemon=self.daemon)
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
 
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
@@ -443,6 +466,12 @@ def _claim_active_session_slot(
 def _release_active_session_slot(session: dict | None) -> None:
     if not session:
         return
+    timer = session.pop("_lease_idle_timer", None)
+    if timer is not None:
+        try:
+            timer.cancel()
+        except Exception:
+            logger.debug("Failed to cancel idle lease timer", exc_info=True)
     lease = session.pop("active_session_lease", None)
     if lease is None:
         return
@@ -458,16 +487,26 @@ def _ensure_turn_lease(sid: str, session: dict) -> str | None:
 
     TUI/desktop sessions acquire their registry lease lazily on the first
     turn (not at session.create/resume, which fire for every composer paint
-    and sidebar switch) and keep it across turns; the idle reaper hands the
+    and sidebar switch) and keep it across turns; the idle timer hands the
     slot back after the configured idle window without conversational
-    activity (see ``_release_idle_session_leases``). This is the re-acquire
-    half: mirrors the platform gateway's claim-per-turn in
+    activity (see ``_schedule_idle_lease_release``; the periodic reaper is a
+    recovery backstop). This is the re-acquire half: mirrors the platform
+    gateway's claim-per-turn in
     ``gateway/run.py`` handle_message.
 
     Returns the limit message when the cap is reached (the caller surfaces
     it as the turn's error), None on success or fail-open.
     """
     with session["history_lock"]:
+        # A new turn owns the current lease. Invalidate any older idle timer
+        # under the same lock its callback uses so a late callback cannot pull
+        # the slot out from under this turn.
+        timer = session.pop("_lease_idle_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                logger.debug("Failed to cancel idle lease timer", exc_info=True)
         if session.get("active_session_lease") is not None:
             return None
     lease, limit_message = _claim_active_session_slot(
@@ -943,11 +982,94 @@ def _lease_idle_release_seconds() -> float:
         return _LEASE_IDLE_RELEASE_DEFAULT_S
 
 
+def _idle_lease_release_blocked(sid: str, session: dict) -> bool:
+    """Return whether work still owns this session's active-turn lease.
+
+    Callers hold ``history_lock`` so turn start, queue drain, and timer expiry
+    share one atomic decision boundary.
+    """
+    if session.get("_finalized") or session.get("running") or session.get("queued_prompt"):
+        return True
+    if _session_pending_kind(sid):
+        return True
+    ready = session.get("agent_ready")
+    return bool(ready is not None and not ready.is_set() and not session.get("lazy"))
+
+
+def _release_idle_active_session_lease_locked(session: dict, *, reason: str) -> bool:
+    """Release registry ownership before exposing an empty session lease slot.
+
+    The caller holds history_lock. Keeping that lock across registry release
+    prevents a new turn from observing ``active_session_lease=None`` while its
+    old registry entry still occupies the cap.
+    """
+    lease = session.get("active_session_lease")
+    if lease is None:
+        return False
+    try:
+        lease.release()
+    except Exception:
+        logger.debug("Failed to release %s active session lease", reason, exc_info=True)
+    finally:
+        if session.get("active_session_lease") is lease:
+            session.pop("active_session_lease", None)
+    return True
+
+
+def _schedule_idle_lease_release(sid: str, session: dict) -> None:
+    """Release this turn lease at the configured idle boundary.
+
+    The periodic reaper remains a recovery sweep. This timer makes the normal
+    path precise and re-checks every protected state at expiry, so queued or
+    chained work keeps the lease without closing the warm runtime.
+    """
+    delay = _lease_idle_release_seconds()
+    if delay <= 0:
+        return
+    lock = session.get("history_lock")
+    if lock is None:
+        return
+
+    timer = None
+
+    def release_if_still_idle() -> None:
+        with lock:
+            if session.get("_lease_idle_timer") is not timer:
+                return
+            session.pop("_lease_idle_timer", None)
+            if _idle_lease_release_blocked(sid, session):
+                return
+            _release_idle_active_session_lease_locked(session, reason="scheduled idle")
+
+    with lock:
+        if session.get("active_session_lease") is None or _idle_lease_release_blocked(
+            sid, session
+        ):
+            return
+        previous = session.pop("_lease_idle_timer", None)
+        if previous is not None:
+            try:
+                previous.cancel()
+            except Exception:
+                logger.debug("Failed to cancel replaced idle lease timer", exc_info=True)
+        timer = _LeaseTimer(delay, release_if_still_idle)
+        timer.daemon = True
+        session["_lease_idle_timer"] = timer
+    try:
+        timer.start()
+    except Exception:
+        with lock:
+            if session.get("_lease_idle_timer") is timer:
+                session.pop("_lease_idle_timer", None)
+        logger.debug("Failed to start idle lease timer", exc_info=True)
+
+
 def _release_idle_session_leases(now: float) -> None:
     """Release the active-session LEASE (not the session) for idle sessions.
 
-    Runs on the reaper cadence. Applies to live-transport sessions too — that
-    is the point: connected-but-idle tabs are exactly the ones the TTL reaper
+    Recovery sweep on the reaper cadence; the normal path uses an exact timer
+    scheduled at the turn-chain idle boundary. Applies to live-transport
+    sessions too — connected-but-idle tabs are exactly the ones the TTL reaper
     can never free. Skips anything mid-turn, awaiting an input/approval
     prompt, holding a queued next-turn prompt, or still building its agent
     (imminent turn). The `running` check happens under history_lock, the same
@@ -978,13 +1100,13 @@ def _release_idle_session_leases(now: float) -> None:
             reference = max(last_active, created_at)
             if (now - reference) <= idle_release_s:
                 continue
-            lease = session.pop("active_session_lease", None)
-        if lease is None:
-            continue
-        try:
-            lease.release()
-        except Exception:
-            logger.debug("Failed to release idle active session lease", exc_info=True)
+            timer = session.pop("_lease_idle_timer", None)
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    logger.debug("Failed to cancel swept idle lease timer", exc_info=True)
+            _release_idle_active_session_lease_locked(session, reason="swept idle")
 
 
 def _reap_idle_sessions() -> None:
@@ -5289,6 +5411,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+        _schedule_idle_lease_release(sid, session)
     return True
 
 
@@ -9544,6 +9667,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 f"{type(_drain_exc).__name__}: {_drain_exc}",
                 file=sys.stderr,
             )
+
+        # This invocation reached the end of its follow-up chain. If another
+        # queued/user/goal/notification turn started meanwhile, the helper sees
+        # running=True and leaves the lease to that turn.
+        _schedule_idle_lease_release(sid, session)
 
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
