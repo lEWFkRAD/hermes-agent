@@ -1197,6 +1197,31 @@ class _CuaDriverSession:
             or "daemon proxy" in msg
         )
 
+    @staticmethod
+    def _is_stale_session_result(out: Dict[str, Any]) -> bool:
+        """Return True for the driver's in-band "session has ended" rejection.
+
+        Distinct from every other failure on this ladder: the driver process is
+        alive and the MCP transport is healthy, so nothing raises and nothing
+        flips ``_started`` — only the driver-side session registry dropped our
+        id (desktop app closed, driver restarted, idle expiry). The rejection
+        arrives as a normal result carrying ``isError``:
+
+            session 'hermes-abc123' has ended; tool call 'list_windows' was
+            rejected. Call start_session with this id to revive it before
+            issuing further actions, or use a new session id.
+
+        Without this rung the message reaches the model verbatim, which retries
+        the identical call until the tool-loop guardrail hard-stops
+        ``computer_use`` for the rest of the turn. Note that
+        ``hermes computer-use doctor`` reports healthy throughout — it checks
+        the MCP layer, not the driver's session registry.
+        """
+        if out.get("isError") is not True:
+            return False
+        msg = out.get("data")
+        return isinstance(msg, str) and "session" in msg and "has ended" in msg
+
     def _restart_session_locked(self) -> None:
         """Recreate the MCP session after the daemon/stdin transport was closed.
         Caller must hold self._lock (the reconnect-once retry path holds it)."""
@@ -1360,7 +1385,7 @@ class _CuaDriverSession:
         # transport (which has its own retry + screenshot-to-file mitigation)
         # rather than burning a long backoff chain on a path that won't recover.
         try:
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            out = self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
         except Exception as e:
             if self._is_transient_daemon_error(e):
                 logger.warning(
@@ -1377,6 +1402,41 @@ class _CuaDriverSession:
             with self._lock:
                 self._restart_session_locked()
             return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+        return self._revive_session_and_retry(name, args, timeout, out)
+
+    def _revive_session_and_retry(
+        self, name: str, args: Dict[str, Any], timeout: float, out: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Revive a driver-side-expired session once, then retry the call.
+
+        The rungs above recover from a dead transport. This one recovers from a
+        live transport whose session id the driver has forgotten — the case
+        ``_is_stale_session_result`` describes, where nothing raises and
+        ``_started`` stays True, so no other rung fires. The driver names the
+        remedy in the rejection itself: call ``start_session`` with the same id.
+
+        Retries exactly once and only over the MCP path. The revive goes through
+        ``call_tool`` so a dead transport underneath still gets the reconnect
+        rung, but ``start_session`` is a lifecycle call and returns early here,
+        so this cannot recurse. Anything still failing after the revive is
+        returned as-is for the caller to surface.
+        """
+        session_id = args.get("session")
+        if (
+            name in self._LIFECYCLE_CALLS
+            or not session_id
+            or not self._is_stale_session_result(out)
+        ):
+            return out
+        logger.warning(
+            "cua-driver rejected %s: session %r has ended; reviving it once", name, session_id
+        )
+        try:
+            self.call_tool("start_session", {"session": session_id}, timeout=timeout)
+        except Exception as e:
+            logger.error("cua-driver could not revive session %r: %s", session_id, e)
+            return out
+        return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
 
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
