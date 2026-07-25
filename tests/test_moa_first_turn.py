@@ -12,7 +12,9 @@ def T(c): return {"role": "tool", "content": c}
 def test_coerce_fanout_allows_first_turn():
     assert _coerce_fanout("first_turn") == "first_turn"
     assert _coerce_fanout("user_turn") == "user_turn"
-    assert _coerce_fanout("bogus") == "per_iteration"
+    # Unknown values fall back to upstream's default cadence (user_turn since
+    # #67199 — was per_iteration when this suite was first written).
+    assert _coerce_fanout("bogus") == "user_turn"
 
 
 def test_normalizer_keeps_first_turn():
