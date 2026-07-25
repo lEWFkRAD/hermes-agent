@@ -526,6 +526,31 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _get_mcp_inherit_exclude() -> set[str]:
+    """MCP server toolsets that delegated subagents must NOT inherit (gateway-only).
+
+    Heavy stdio MCP servers -- notably serena-code, which cold-starts a pyright
+    LSP over the whole codebase -- cost ~1.5GB RAM + ~26s + a Windows console
+    flash on every boot. With inherit_mcp_toolsets on, each delegated subagent
+    re-boots the full fleet, which is pure waste when only the gateway loop
+    exercises the server. Listing a server under config ``mcp_inherit_exclude``
+    keeps it gateway-only. Names may be given with or without the canonical
+    ``mcp-`` prefix; both ``serena-code`` and ``mcp-serena-code`` are matched.
+    """
+    cfg = _load_config()
+    raw = cfg.get("mcp_inherit_exclude") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    out: set[str] = set()
+    for name in raw:
+        s = str(name).strip()
+        if not s:
+            continue
+        out.add(s)
+        out.add(s[4:] if s.startswith("mcp-") else f"mcp-{s}")
+    return out
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -576,8 +601,13 @@ def _preserve_parent_mcp_toolsets(
     child_toolsets: List[str], parent_toolsets: set[str]
 ) -> List[str]:
     """Append any parent MCP toolsets that are missing from a narrowed child."""
+    exclude = _get_mcp_inherit_exclude()
     preserved = list(child_toolsets)
     for toolset_name in sorted(parent_toolsets):
+        # Gateway-only MCP servers (e.g. serena-code) are never re-booted in a
+        # delegated subagent -- see _get_mcp_inherit_exclude for the why.
+        if toolset_name in exclude:
+            continue
         if _is_mcp_toolset_name(toolset_name) and toolset_name not in preserved:
             preserved.append(toolset_name)
     return preserved
