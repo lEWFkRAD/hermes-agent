@@ -146,13 +146,18 @@ def _call(
         from agent.moa_loop import _slot_runtime
 
         runtime = _slot_runtime(slot)
-        extra_body = {"response_format": {"type": "json_object"}} if json_mode else None
+        # _slot_runtime may itself carry extra_body (per-slot request_overrides,
+        # e.g. enable_thinking on GRM slots) — merge rather than pass twice, or
+        # call_llm raises "got multiple values for keyword argument 'extra_body'".
+        extra_body = dict(runtime.pop("extra_body", None) or {})
+        if json_mode:
+            extra_body["response_format"] = {"type": "json_object"}
         response = call_llm(
             task="amdp",
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            extra_body=extra_body,
+            extra_body=extra_body or None,
             timeout=_active_call_timeout,
             **runtime,
         )
