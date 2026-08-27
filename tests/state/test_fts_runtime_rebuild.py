@@ -249,6 +249,11 @@ class TestRuntimeFtsRebuild:
             fd_dir.mkdir(parents=True)
         # PID 222 holds the deleted WAL sidecar
         os.symlink(db_path_wal + " (deleted)", str(proc_root / "222" / "fd" / "3"))
+        # Windows resolves symlink targets into \\?\ extended-path strings,
+        # which never canonicalize to the watched paths — the /proc simulation
+        # can only prove itself on POSIX.
+        if os.readlink(str(proc_root / "222" / "fd" / "3")).startswith("\\\\?\\"):
+            pytest.skip("readlink returns \\\\?\\ paths on Windows")
         # PID 111 (self) holds the db — should be excluded
         os.symlink(str(db_path), str(proc_root / "111" / "fd" / "3"))
         # PID 333 holds an unrelated file
