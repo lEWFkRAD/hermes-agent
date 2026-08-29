@@ -15,11 +15,22 @@ crashes due to a bad timezone string.
 
 import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from hermes_constants import get_config_path
-from typing import Optional
+from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
+
+# Context-local timezone-override MARKER (mutable cell, mirroring
+# set_hermes_home_override's token style). When set, get_timezone()/now()
+# resolve the zone from the CURRENT context's config (which follows the
+# active HERMES_HOME override) instead of the process-global cache — used by
+# the multiplexed cron tick so each profile's schedule is evaluated on its
+# own clock (#97905). Resolved lazily and NOT cached inside the override:
+# a profile's config.yaml can change between ticks.
+_TZ_OVERRIDE: ContextVar[Optional[list]] = ContextVar("_TZ_OVERRIDE", default=None)
 
 try:
     from zoneinfo import ZoneInfo
@@ -97,13 +108,49 @@ def get_timezone() -> Optional[ZoneInfo]:
     """Return the user's configured ZoneInfo, or None (meaning server-local).
 
     Resolved once and cached. Call ``reset_cache()`` after config changes.
+
+    Inside a :func:`use_timezone_override` context the profile-scoped config
+    is consulted on EVERY call (lazily — profile config may change between
+    ticks), so a multiplexed tick sees its own profile's zone even though the
+    process-global cache holds another profile's. With the override unset,
+    behavior is byte-identical to before.
     """
+    cell = _TZ_OVERRIDE.get()
+    if cell is not None:
+        tz = _get_zoneinfo(_resolve_timezone_name())
+        cell[0] = tz
+        return tz
     global _cached_tz, _cached_tz_name, _cache_resolved
     if not _cache_resolved:
         _cached_tz_name = _resolve_timezone_name()
         _cached_tz = _get_zoneinfo(_cached_tz_name)
         _cache_resolved = True
     return _cached_tz
+
+
+@contextmanager
+def use_timezone_override() -> Iterator[None]:
+    """Resolve the timezone from the CURRENT context's config on every call.
+
+    Companion to ``set_hermes_home_override`` / ``use_cron_store`` for
+    per-profile cron ticks (#97905): with a HERMES_HOME override active, the
+    shared cached ``read_raw_config()``/``get_config_path()`` path already
+    follows that override, so inside this context ``get_timezone()`` /
+    ``now()`` return the *ticked profile's* zone instead of whatever zone the
+    process-global cache froze first. Nest-safe and per-task: sibling tasks
+    ticking different profiles never see each other's zone. Unset on exit —
+    the process-global cache is left untouched.
+    """
+    cell = _TZ_OVERRIDE.get()
+    # Re-entrant: an inner tick already scoped just shares the outer cell.
+    if cell is not None:
+        yield
+        return
+    token = _TZ_OVERRIDE.set([None])
+    try:
+        yield
+    finally:
+        _TZ_OVERRIDE.reset(token)
 
 
 def reset_cache() -> None:

@@ -674,6 +674,7 @@ class InProcessCronScheduler(CronScheduler):
             use_cron_store,
         )
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_time import use_timezone_override
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info(
@@ -714,7 +715,7 @@ class InProcessCronScheduler(CronScheduler):
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
-                            with use_cron_store(home):
+                            with use_cron_store(home), use_timezone_override():
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,
