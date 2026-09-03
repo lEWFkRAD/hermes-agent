@@ -3142,12 +3142,50 @@ def _has_allowlist_shell_operator(command: str) -> bool:
     return has_reinterpretable and bool(_REINTERPRETED_ARGUMENT_RE.search(command))
 
 
+# Pattern keys are detector identifiers (pattern descriptions such as
+# ``script execution via heredoc``, the synthetic ``execute_code`` key,
+# ``plugin_rule:*``, ``tirith:*``), never shell command text. They are
+# matched via is_approved()/alias resolution, so the command-text glob
+# matcher must never see them (#102443): a detector key can never equal
+# command text, and letting it through makes a permanent 'always' approval
+# look like coverage while silently never matching again.
+_NON_GLOB_PATTERN_KEYS: frozenset = frozenset(
+    {_description for _, _description in DANGEROUS_PATTERNS}
+    | {
+        "execute_code",
+        _PARSER_LIMIT_DESCRIPTION,
+        _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION,
+    }
+    | set(_REMOVED_PATTERN_KEY_ALIASES)
+    | {
+        _legacy_key
+        for _keys in _PATTERN_KEY_ALIASES.values()
+        for _legacy_key in _keys
+    }
+)
+
+
+def _is_detector_pattern_key(pattern: str) -> bool:
+    """Return True when an allowlist entry is a detector pattern key.
+
+    Detector keys live in ``_permanent_approved`` (loaded from
+    ``command_allowlist``) but must be excluded from command-text glob
+    matching — see #102443.
+    """
+    return (
+        pattern in _NON_GLOB_PATTERN_KEYS
+        or pattern.startswith("plugin_rule:")
+        or pattern.startswith("tirith:")
+    )
+
+
 def _command_matches_permanent_allowlist(command: str) -> bool:
     """Return True when command_allowlist contains this command or a glob.
 
-    Permanent approvals historically store dangerous-pattern keys such as
-    ``recursive delete``. Manual entries in ``command_allowlist`` are command
-    text, and may include shell-style wildcards like ``podman *``.
+    Manual entries in ``command_allowlist`` are command text and may include
+    shell-style wildcards like ``podman *``. Detector pattern keys (persisted
+    by permanent 'always' approvals) are excluded here — they are matched by
+    is_approved(), and matching them as command text would always fail.
     """
     command = (command or "").strip()
     if not command:
@@ -3163,6 +3201,8 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
             continue
         pattern = pattern.strip()
         if not pattern:
+            continue
+        if _is_detector_pattern_key(pattern):
             continue
         if command == pattern:
             return True
