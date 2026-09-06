@@ -73,8 +73,9 @@ def validate_tool_calls(
     """Validate ``assistant_message.tool_calls`` in place (ids uniquified, names
     repaired, dict/empty args normalized to JSON strings). Strikes for invalid names
     advance only when a turn has NO valid call, so a degenerate model still halts at
-    3; args cut off mid-stream (routers rewrite ``length`` → ``tool_calls``) are refused
-    outright rather than retried."""
+    3; args cut off mid-stream (routers rewrite ``length`` → ``tool_calls``) share the
+    bounded invalid-JSON recovery — re-issue, then recovery results — instead of a
+    first-strike task kill (#103969)."""
     from agent.conversation_loop import _invalid_tool_name_error_content
 
     tool_calls = assistant_message.tool_calls
@@ -167,22 +168,24 @@ def validate_tool_calls(
             not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
             for tc in tool_calls if tc.function.name in invalid_names
         )
+        agent._invalid_json_retries += 1
         if _truncated:
+            # Same failure class as the streaming path (turn_truncation), which
+            # retries up to its ceiling before exiting partial. Transient
+            # provider/router truncation of large tool-call payloads is
+            # recoverable — re-issue the request instead of killing the task on
+            # the first strike. The terminal error must not assert an
+            # unproven "output length limit" cause (#103969, #91738).
             agent._vprint(
                 f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
                 f"(finish_reason={finish_reason!r}) — refusing to execute.",
                 force=True,
             )
-            agent._invalid_json_retries = 0
-            agent._cleanup_task_resources(effective_task_id)
-            return _verdict("return", _partial_exit(
-                agent, messages, conversation_history, api_call_count,
-                "Response truncated due to output length limit",
-            ))
-
-        agent._invalid_json_retries += 1
-        tool_name, error_msg = invalid_json_args[0]
-        agent._buffer_vprint(f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
+        else:
+            tool_name, error_msg = invalid_json_args[0]
+            agent._buffer_vprint(
+                f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}"
+            )
 
         if agent._invalid_json_retries < 3:
             agent._buffer_vprint(f"🔄 Retrying API call ({agent._invalid_json_retries}/3)...")
@@ -192,9 +195,7 @@ def validate_tool_calls(
         # Using tool results (not user messages) preserves role alternation.
         agent._buffer_vprint("⚠️  Injecting recovery tool results for invalid JSON...")
         agent._invalid_json_retries = 0  # Reset for next attempt
-        # Append the assistant message with its (broken) tool_calls, then one
-        # error result per call.
-        append_message(messages, agent._build_assistant_message(assistant_message, finish_reason))
+        # MUTANT: skip appending assistant + recovery results, just continue
 
         def _json_error_result(tc) -> str:
             if tc.function.name not in invalid_names:

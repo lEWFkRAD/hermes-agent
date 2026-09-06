@@ -4563,8 +4563,10 @@ class TestRunConversation:
         assert result["final_response"] == "Done!"
 
 
-    def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
-        """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
+    def test_truncated_tool_json_recovers_via_bounded_retry(self, agent):
+        """#103969: finish_reason=tool_calls + truncated args after a real tool
+        retries the API call (bounded, shared counter) instead of a first-strike
+        task kill; the model's next valid response completes the turn."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         good_tc = _mock_tool_call(
@@ -4583,20 +4585,34 @@ class TestRunConversation:
         bad_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[bad_tc],
         )
-        agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
+        retry_ok_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full"}',
+            call_id="c_retry",
+        )
+        retry_ok = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[retry_ok_tc],
+        )
+        agent.client.chat.completions.create.side_effect = [
+            good_resp, bad_resp,      # truncated args -> bounded retry, no task kill
+            retry_ok,                 # retry produces valid args -> tool runs
+            _mock_response(content="Done!", finish_reason="stop"),
+        ]
 
         with (
-            patch("model_tools.handle_function_call", return_value='{"success":true}'),
+            patch("model_tools.handle_function_call", return_value='{"success":true}') as mock_hfc,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("write then truncate")
 
-        assert result.get("partial") is True
+        assert result.get("completed") is True
+        assert result.get("final_response") == "Done!"
+        # Both the original batch and the retried call executed — the truncated
+        # one never did.
+        assert mock_hfc.call_count == 2
         msgs = result.get("messages") or []
-        assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
         assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
 
 
