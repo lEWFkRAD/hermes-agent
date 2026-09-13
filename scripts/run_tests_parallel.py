@@ -91,6 +91,35 @@ _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 _DURATIONS_FILE = "test_durations.json"
 
 
+# These Win32 values are exposed by ``subprocess`` only on Windows. Keep
+# local fallbacks so the pure kwargs contract can be tested on Linux too; the
+# values are passed to Popen only when the running host is Windows.
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _child_process_isolation_kwargs(*, is_windows: bool | None = None) -> Dict[str, int | bool]:
+    """Return Popen kwargs that isolate one pytest child from the runner.
+
+    POSIX needs a new session because :func:`_kill_tree` later kills the
+    captured process group with ``killpg``. Windows needs explicit creation
+    flags: ``start_new_session`` is the POSIX session mechanism, not a
+    Windows process-group boundary. In particular, don't treat
+    ``os.kill(pid, 0)`` as a harmless Windows liveness probe: zero aliases a
+    console-control-event value there, unlike POSIX signal zero.
+
+    ``is_windows`` makes the platform-specific result a pure, Linux-testable
+    contract; production leaves it as the host platform.
+    """
+    if is_windows is None:
+        is_windows = sys.platform == "win32"
+    if is_windows:
+        return {
+            "creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
+        }
+    return {"start_new_session": True}
+
+
 def _approximately_count_tests(
     files: List[Path], repo_root: Path
 ) -> dict[Path, int]:
@@ -252,34 +281,7 @@ def _run_one_file(
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
 
-    # Isolate each pytest child from the runner's console / process group.
-    #
-    # POSIX: start_new_session=True → os.setsid() in the child, placing it
-    # at the head of its own process group so _kill_tree can SIGKILL the
-    # group atomically.
-    #
-    # Windows: start_new_session only maps to CREATE_NEW_PROCESS_GROUP in
-    # CPython 3.12+ — on 3.11 it is silently ignored, so every child
-    # shared the runner's console process group. One os.kill(pid, 0)
-    # liveness probe anywhere in the run — which on Windows routes through
-    # GenerateConsoleCtrlEvent (bpo-14484) — then broadcast
-    # KeyboardInterrupt to every concurrent child AND the runner itself.
-    # Pass the creationflags explicitly, on every Python version:
-    #   CREATE_NEW_PROCESS_GROUP — child is its own ctrl-event group root,
-    #     so console ctrl events can't fan out across children;
-    #   CREATE_NO_WINDOW — child gets its own invisible console, fully
-    #     insulating it from ctrl-event broadcasts on the runner's console
-    #     (and suppressing per-child conhost window flashes).
-    # _kill_tree handles the Windows kill path via taskkill /F /T.
-    if sys.platform == "win32":
-        isolation_kwargs: Dict[str, object] = {
-            "creationflags": (
-                subprocess.CREATE_NEW_PROCESS_GROUP
-                | subprocess.CREATE_NO_WINDOW
-            ),
-        }
-    else:
-        isolation_kwargs = {"start_new_session": True}
+    isolation_kwargs = _child_process_isolation_kwargs()
 
     subproc_start = time.monotonic()
     # launch the pytest process

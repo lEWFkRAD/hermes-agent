@@ -24,43 +24,25 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 
-# Both tests share the same handoff file: the leaker writes here, the
-# verifier reads here. We park it in $TMPDIR with a unique-per-run name
-# so concurrent invocations of the suite don't clobber each other.
-_HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
-_HANDOFF_DIR.mkdir(exist_ok=True)
-
-
 def _handoff_path_for(nonce: str) -> Path:
-    return _HANDOFF_DIR / f"grandchild-{nonce}.json"
+    """Return a cross-platform handoff path without writing at import time."""
+    handoff_dir = Path(tempfile.gettempdir()) / "hermes-isolation-probe"
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    return handoff_dir / f"grandchild-{nonce}.json"
 
 
 def _pid_alive(pid: int) -> bool:
-    """POSIX: send signal 0 to probe whether ``pid`` is still alive.
-
-    ``os.kill(pid, 0)`` raises ``ProcessLookupError`` if the process is
-    gone, ``PermissionError`` if it exists but we can't signal it
-    (someone else's pid). We treat PermissionError as "alive" because
-    the process exists and that's all we need to know.
-    """
-    if sys.platform == "win32":  # pragma: no cover — POSIX-only test
-        # On Windows we'd use OpenProcess + GetExitCodeProcess; this
-        # test is skipped on Windows so the path is unreachable.
-        raise RuntimeError("_pid_alive POSIX-only")
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Return whether a process exists without relying on signal-zero semantics."""
+    return psutil.pid_exists(pid)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
@@ -290,23 +272,28 @@ def _load_runner_module():
     return mod
 
 
-def test_children_spawn_in_their_own_process_group(monkeypatch, tmp_path: Path) -> None:
-    """Every pytest child must be isolated from the runner's process group.
+def test_child_process_isolation_kwargs_are_portable() -> None:
+    """Both OS contracts remain testable without pretending to run Windows."""
+    mod = _load_runner_module()
 
-    POSIX: ``start_new_session=True`` (os.setsid) so ``_kill_tree`` can
-    SIGKILL the group atomically.
+    assert mod._child_process_isolation_kwargs(is_windows=False) == {
+        "start_new_session": True,
+    }
+    assert mod._child_process_isolation_kwargs(is_windows=True) == {
+        "creationflags": (
+            mod._CREATE_NEW_PROCESS_GROUP | mod._CREATE_NO_WINDOW
+        ),
+    }
 
-    Windows: ``start_new_session`` is silently IGNORED before CPython 3.12,
-    so the runner must pass ``CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW``
-    creationflags explicitly. Without them every child shares the runner's
-    console process group, and a single ``os.kill(pid, 0)`` liveness probe
-    anywhere in the run — which on Windows routes through
-    GenerateConsoleCtrlEvent (bpo-14484) — broadcasts KeyboardInterrupt to
-    every concurrent child AND the runner itself (observed: the runner died
-    at 100% completion with ~200 collateral KeyboardInterrupt failures).
-    """
+
+@pytest.mark.parametrize("is_windows", [False, True])
+def test_runner_passes_child_isolation_kwargs_to_popen(
+    monkeypatch, tmp_path: Path, is_windows: bool,
+) -> None:
+    """Both platform kwargs flow through the Popen launch on every host."""
     mod = _load_runner_module()
     captured: dict = {}
+    isolation_kwargs = mod._child_process_isolation_kwargs
 
     class _FakeProc:
         pid = 99999
@@ -329,14 +316,15 @@ def test_children_spawn_in_their_own_process_group(monkeypatch, tmp_path: Path) 
     # _kill_tree shells out to taskkill on Windows — neuter it so the fake
     # pid can't hit a real process.
     monkeypatch.setattr(mod, "_kill_tree", lambda proc, pgid=None: None)
+    monkeypatch.setattr(
+        mod,
+        "_child_process_isolation_kwargs",
+        lambda: isolation_kwargs(is_windows=is_windows),
+    )
 
     probe = tmp_path / "test_probe.py"
-    probe.write_text("def test_ok():\n    assert True\n")
+    probe.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
     mod._run_one_file(probe, [], tmp_path, 30.0)
 
-    if sys.platform == "win32":
-        flags = captured.get("creationflags", 0)
-        assert flags & subprocess.CREATE_NEW_PROCESS_GROUP, captured
-        assert flags & subprocess.CREATE_NO_WINDOW, captured
-    else:
-        assert captured.get("start_new_session") is True, captured
+    expected = isolation_kwargs(is_windows=is_windows)
+    assert {key: captured[key] for key in expected} == expected
