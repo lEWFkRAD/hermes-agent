@@ -1001,7 +1001,8 @@ export const zhHant = defineLocale({
       runtimeInstalled: '已安裝 llama.cpp 執行環境',
       runtimeInstalledDetail: (tag, backend) => `組建 ${tag}，${backend} 後端。Hermes 會為您啟動並管理伺服器。`,
       installTitle: '安裝本地執行環境',
-      installDetail: '下載 llama.cpp 推理引擎（數百 MB）。下載的模型完全在本機執行——無需帳號，資料不會離開您的電腦。',
+      installDetail:
+        '下載 llama.cpp 推理引擎（數百 MB）。模型和聊天會留在本機；只有您檢視並明確提交的基準測試報告才會離開本機。',
       installAction: '安裝執行環境',
       installing: '正在安裝執行環境…',
       installFailed: '執行環境安裝失敗',
@@ -1097,6 +1098,52 @@ export const zhHant = defineLocale({
       sideloadTitle: '選擇 GGUF 模型檔案',
       sideloadDone: '已新增 {name}。',
       sideloadAlreadyPresent: '已在你的庫中。',
+      benchmarkTitle: '分享本機基準測試',
+      benchmarkSubtitle: '執行簡短的本機測試，檢視報告後再選擇是否傳送。絕不會自動提交。',
+      benchmarkRunTitle: '執行基準測試',
+      benchmarkRun: '執行基準測試',
+      benchmarkRunning: '正在執行基準測試…',
+      benchmarkRunDetail: model => `以簡短的本機生成測試測量 ${model}。`,
+      benchmarkServerNeeded: '請先啟動本機伺服器再執行基準測試。',
+      benchmarkReportModelTitle: '模型',
+      benchmarkReportRuntime: '執行環境',
+      benchmarkReportHardwareTitle: '硬體',
+      benchmarkReportPlacementTitle: '記憶體放置',
+      benchmarkReportResultsTitle: '基準測試結果',
+      benchmarkReportWorkloadTitle: '測試負載',
+      benchmarkReportMetaTitle: '報告',
+      benchmarkReportModel: (family, quant, weights, lookup) =>
+        `${family} · ${quant} · 權重 ${weights} · 查找表 ${lookup}`,
+      benchmarkReportConfig: (engine, context, slots, kvCache, speculation) =>
+        `${engine} · ${context} 上下文 · ${slots} 個槽位 · ${kvCache} KV · ${speculation}`,
+      benchmarkReportHardware: (deviceMemory, systemMemory, unifiedMemory) =>
+        `${deviceMemory} 裝置記憶體 · ${systemMemory} 系統記憶體${unifiedMemory ? ' · 統一記憶體' : ''}`,
+      benchmarkReportPlacement: (lookup, ordinaryMemorySpill) =>
+        `${lookup} · ${ordinaryMemorySpill ? '使用系統記憶體' : '沒有一般記憶體溢出'}`,
+      benchmarkReportResult: (wallTimeMs, promptRate, completionRate) =>
+        `${wallTimeMs.toLocaleString()} 毫秒 · 提示 ${promptRate} · 生成 ${completionRate}`,
+      benchmarkReportWorkload: (request, promptTokens, completionTokens) =>
+        `${request} · 提示 ${promptTokens.toLocaleString()} 個 token · 生成 ${completionTokens.toLocaleString()} 個 token`,
+      benchmarkReportMeta: (packageId, createdAt, schemaVersion) =>
+        `一次性報告 ${packageId} · 建立於 ${createdAt} · ${schemaVersion}`,
+      benchmarkMemory: gibibytes => `${gibibytes.toFixed(1)} GB`,
+      benchmarkRate: tokensPerSecond => `${tokensPerSecond.toFixed(1)} tok/s`,
+      benchmarkContext: tokens => `${Math.round(tokens / 1024)}K`,
+      benchmarkUnavailable: '—',
+      benchmarkNoLookup: '無查找表',
+      benchmarkReviewTitle: '分享前請確認',
+      benchmarkPrivacy:
+        '僅包含一次性報告 ID 和建立時間；模型系列／量化、權重和查找表大小／放置；執行環境組建／設定；裝置和系統記憶體容量；以及基準測試時長、詞元計數和速率。絕不包含提示文字、生成文字、聊天、檔案、路徑、主機名稱、帳號、別名或永久安裝 ID。',
+      benchmarkSubmit: '提交報告',
+      benchmarkSubmitting: '正在提交報告…',
+      benchmarkSubmitTitle: '提交這份基準測試報告？',
+      benchmarkSubmitDescription:
+        '僅傳送您已檢視的一次性報告 ID 和建立時間；模型系列／量化、權重和查找表大小／放置；執行環境組建／設定；裝置和系統記憶體容量；以及基準測試時長、詞元計數和速率。絕不包含提示文字、生成文字、聊天、檔案、路徑、主機名稱、帳號、別名或永久安裝 ID。往後的報告仍需要您的確認。',
+      benchmarkSubmitted: '基準測試報告已提交。',
+      benchmarkFailed: '無法執行或提交基準測試',
+      benchmarkSharingEnabled: '手動分享已啟用',
+      benchmarkStopSharing: '關閉提交同意',
+      benchmarkConsentStopped: '基準測試提交同意已關閉。',
       pillFullContext: max => `完整 ${max} 上下文`,
       pillFullContextTip: '從一開始就以模型的完整上下文視窗執行',
       pillUpTo: max => `最高 ${max} 上下文`,

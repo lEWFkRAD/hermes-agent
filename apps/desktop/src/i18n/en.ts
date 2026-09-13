@@ -1135,7 +1135,7 @@ export const en: Translations = {
         `Build ${tag}, ${backend} backend. Hermes starts and manages the server for you.`,
       installTitle: 'Install the local runtime',
       installDetail:
-        'Downloads the llama.cpp inference engine (a few hundred MB). Models you download run entirely on this machine — no account, nothing leaves your computer.',
+        'Downloads the llama.cpp inference engine (a few hundred MB). Models and chats stay on this machine; only a benchmark report you explicitly review and submit can leave it.',
       installAction: 'Install runtime',
       installing: 'Installing runtime…',
       installFailed: 'Runtime install failed',
@@ -1165,7 +1165,7 @@ export const en: Translations = {
       installDoneToast: 'Local runtime installed and ready.',
       quickstartTitle: 'Run a model on this machine',
       quickstartDetail: (model, size) =>
-        `One click sets everything up: the local engine, ${model} (${size} download), and your default for new chats. Nothing leaves this computer.`,
+        `One click sets everything up: the local engine, ${model} (${size} download), and your default for new chats. Models and chats stay local unless you explicitly submit a benchmark report.`,
       quickstartDetailReady: model =>
         `One click makes ${model} your default for new chats. Everything runs on this machine.`,
       quickstartAction: 'Set up for me',
@@ -1253,6 +1253,53 @@ export const en: Translations = {
       sideloadTitle: 'Choose a GGUF model file',
       sideloadDone: 'Added {name}.',
       sideloadAlreadyPresent: 'Already in your library.',
+      benchmarkTitle: 'Share a local benchmark',
+      benchmarkSubtitle:
+        'Run a short local test, review the report, then choose whether to send it. Nothing is submitted automatically.',
+      benchmarkRunTitle: 'Run benchmark',
+      benchmarkRun: 'Run benchmark',
+      benchmarkRunning: 'Running benchmark…',
+      benchmarkRunDetail: model => `Measure ${model} with a short local generation test.`,
+      benchmarkServerNeeded: 'Start the local server to run a benchmark.',
+      benchmarkReportModelTitle: 'Model',
+      benchmarkReportRuntime: 'Runtime',
+      benchmarkReportHardwareTitle: 'Hardware',
+      benchmarkReportPlacementTitle: 'Memory placement',
+      benchmarkReportResultsTitle: 'Benchmark results',
+      benchmarkReportWorkloadTitle: 'Test workload',
+      benchmarkReportMetaTitle: 'Report',
+      benchmarkReportModel: (family, quant, weights, lookup) =>
+        `${family} · ${quant} · ${weights} weights · ${lookup} lookup table`,
+      benchmarkReportConfig: (engine, context, slots, kvCache, speculation) =>
+        `${engine} · ${context} context · ${slots} slots · ${kvCache} KV · ${speculation}`,
+      benchmarkReportHardware: (deviceMemory, systemMemory, unifiedMemory) =>
+        `${deviceMemory} device memory · ${systemMemory} system memory${unifiedMemory ? ' · unified memory' : ''}`,
+      benchmarkReportPlacement: (lookup, ordinaryMemorySpill) =>
+        `${lookup} · ${ordinaryMemorySpill ? 'uses system RAM' : 'no ordinary RAM spill'}`,
+      benchmarkReportResult: (wallTimeMs, promptRate, completionRate) =>
+        `${wallTimeMs.toLocaleString()} ms · prompt ${promptRate} · generation ${completionRate}`,
+      benchmarkReportWorkload: (request, promptTokens, completionTokens) =>
+        `${request} · ${promptTokens.toLocaleString()} prompt tokens · ${completionTokens.toLocaleString()} generated tokens`,
+      benchmarkReportMeta: (packageId, createdAt, schemaVersion) =>
+        `One-time report ${packageId} · created ${createdAt} · ${schemaVersion}`,
+      benchmarkMemory: gibibytes => `${gibibytes.toFixed(1)} GB`,
+      benchmarkRate: tokensPerSecond => `${tokensPerSecond.toFixed(1)} tok/s`,
+      benchmarkContext: tokens => `${Math.round(tokens / 1024)}K`,
+      benchmarkUnavailable: '—',
+      benchmarkNoLookup: 'No lookup table',
+      benchmarkReviewTitle: 'Review before sharing',
+      benchmarkPrivacy:
+        'Contains only a one-time report ID and creation time; model family/quant, weight and lookup-table sizes/placement; runtime build/settings; device and system-memory amounts; and benchmark timing, token counts, and rates. Never includes prompt or generated text, chats, files, paths, hostnames, accounts, aliases, or a persistent install ID.',
+      benchmarkSubmit: 'Submit report',
+      benchmarkSubmitting: 'Submitting report…',
+      benchmarkSubmitTitle: 'Submit this benchmark report?',
+      benchmarkSubmitDescription:
+        'Send only the reviewed one-time report ID and creation time; model family/quant, weight and lookup-table sizes/placement; runtime build/settings; device and system-memory amounts; and benchmark timing, token counts, and rates. It never includes prompt or generated text, chats, files, paths, hostnames, accounts, aliases, or a persistent install ID. Future reports still require your confirmation.',
+      benchmarkSubmitted: 'Benchmark report submitted.',
+      benchmarkFailed: 'Could not run or submit the benchmark',
+      benchmarkSharingEnabled: 'Manual sharing enabled',
+      benchmarkStopSharing: 'Turn off submission consent',
+      benchmarkConsentStopped: 'Benchmark submission consent turned off.',
       pillFullContext: max => `Full ${max} context`,
       pillFullContextTip: "Runs at the model's complete context window from the start",
       pillUpTo: max => `Up to ${max} context`,

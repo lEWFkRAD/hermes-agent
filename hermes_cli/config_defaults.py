@@ -2057,6 +2057,17 @@ DEFAULT_CONFIG = {
             # Non-HTTPS refused unless the host is localhost.
             "endpoint": "https://telemetry.nousresearch.com/v1/telemetry",
         },
+        # One-shot local-model benchmark reports are distinct from shared metrics. Hermes never
+        # collects or sends them in the background: a person first runs the benchmark locally,
+        # reviews its closed report, and confirms each submission in the Local Models pane.
+        "local_model_benchmarks": {
+            # Records consent after the first confirmed submission; revoke it from Local Models or
+            # config.yaml. Even when true, each report still needs its own explicit Submit click.
+            "enabled": False,
+            # Kept config-visible (not env-overridable) so a consented report cannot be silently
+            # redirected. Plain HTTP is refused unless the destination is loopback for testing.
+            "endpoint": "https://telemetry.nousresearch.com/v1/telemetry",
+        },
     },
 
     "doctor": {

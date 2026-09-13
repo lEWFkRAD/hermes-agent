@@ -1976,6 +1976,13 @@ telemetry:
     send: false
     # endpoint: https://telemetry.nousresearch.com/v1/telemetry
 
+  # Optional one-shot local-model benchmark contributions. Hermes runs the test
+  # locally first, shows the exact report, and sends it only after you click
+  # Submit. This never runs automatically after a model download.
+  local_model_benchmarks:
+    enabled: false
+    # endpoint: https://telemetry.nousresearch.com/v1/telemetry
+
 
 # =============================================================================
 # Update Behavior

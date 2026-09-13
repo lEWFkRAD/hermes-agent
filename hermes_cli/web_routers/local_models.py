@@ -32,7 +32,7 @@ from starlette.concurrency import run_in_threadpool
 
 from hermes_cli import config as config_mod, web_deps
 from hermes_cli.local_runtime import (
-    binaries, bootstrap, catalog, context_policy, estimator, growth, hardware, hf_browse,
+    benchmark, binaries, bootstrap, catalog, context_policy, estimator, growth, hardware, hf_browse,
     load_progress, presets, supervisor,
 )
 from hermes_cli.local_runtime.endpoint import _state_endpoint
@@ -58,6 +58,18 @@ _QUICKSTART_LOCK = threading.Lock()
 # restart the one managed server. Reject a second click while that transaction
 # is in flight rather than letting two config snapshots race each other.
 _ADVANCED_APPLY_LOCK = threading.Lock()
+# A benchmark explicitly loads and warms a model before timing a generation.  More than one at a
+# time would turn the result into a contention test and can evict an active user's model, so this
+# is a one-at-a-time user action rather than a background job class.
+_BENCHMARK_LOCK = threading.Lock()
+# A browser can edit a preview before posting it back.  Keep only reports that this
+# process generated, for a short time, and require the exact normalized report
+# before it can become an outbound request.  This is intentionally
+# in memory: a restart revokes stale previews rather than treating them as consent.
+_BENCHMARK_REPORT_TTL_SECONDS = 15 * 60
+_MAX_PENDING_BENCHMARK_REPORTS = 8
+_PENDING_BENCHMARK_REPORTS: Dict[str, tuple[float, dict[str, Any], bool]] = {}
+_PENDING_BENCHMARK_REPORTS_LOCK = threading.Lock()
 _LLAMACPP_PROVIDERS = ("llamacpp", "llama.cpp", "llama-cpp")
 _SPLIT_PART_RE = r"-\d{5}-of-\d{5}"
 _SPLIT_GGUF_RE = re.compile(
@@ -133,6 +145,22 @@ class GatewayPublishBody(BaseModel):
     alias: str
     model_id: str
     mode: str = "agent"  # agent | raw
+
+
+class BenchmarkRunBody(BaseModel):
+    model_id: str
+
+
+class BenchmarkSubmitBody(BaseModel):
+    # The browser only receives a closed report from this router.  The endpoint validates it again
+    # before it becomes an outbound request, so a devtools caller cannot turn this into an arbitrary
+    # data-upload tunnel.
+    report: dict[str, Any]
+    enable_submission: bool = False
+
+
+class BenchmarkConsentBody(BaseModel):
+    enabled: bool
 
 
 def _human_gb(n: int | float) -> str:
@@ -907,6 +935,202 @@ def local_models_hardware():
     }
     out.update(_quiet(_nvidia_smi_facts, {}))
     return out
+
+
+# ── user-submitted local benchmark ─────────────────────────
+def _prune_pending_benchmark_reports(now: float) -> None:
+    """Drop expired one-shot previews while the pending-report lock is held."""
+    expired = [
+        package_id
+        for package_id, (expires_at, _report, _in_flight) in _PENDING_BENCHMARK_REPORTS.items()
+        if expires_at <= now
+    ]
+    for package_id in expired:
+        _PENDING_BENCHMARK_REPORTS.pop(package_id, None)
+
+
+def _remember_benchmark_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Keep one closed preview available for a deliberate, short-lived submission."""
+    normalized = benchmark.validate_report(report)
+    package_id = normalized["package_id"]
+    now = time.monotonic()
+    with _PENDING_BENCHMARK_REPORTS_LOCK:
+        _prune_pending_benchmark_reports(now)
+        # A user may run another benchmark before deciding.  Bound retained data,
+        # but never evict a report already in an outbound request.
+        while len(_PENDING_BENCHMARK_REPORTS) >= _MAX_PENDING_BENCHMARK_REPORTS:
+            evictable = [
+                (expires_at, candidate_id)
+                for candidate_id, (expires_at, _candidate, in_flight)
+                in _PENDING_BENCHMARK_REPORTS.items()
+                if not in_flight
+            ]
+            if not evictable:
+                raise benchmark.BenchmarkSubmissionError(
+                    "A benchmark submission is already in progress. Try again shortly."
+                )
+            _PENDING_BENCHMARK_REPORTS.pop(min(evictable)[1], None)
+        _PENDING_BENCHMARK_REPORTS[package_id] = (
+            now + _BENCHMARK_REPORT_TTL_SECONDS,
+            normalized,
+            False,
+        )
+    return normalized
+
+
+def _reserve_benchmark_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Reserve an exact, unexpired preview so it cannot be sent twice concurrently."""
+    normalized = benchmark.validate_report(report)
+    package_id = normalized["package_id"]
+    now = time.monotonic()
+    with _PENDING_BENCHMARK_REPORTS_LOCK:
+        _prune_pending_benchmark_reports(now)
+        pending = _PENDING_BENCHMARK_REPORTS.get(package_id)
+        if pending is None or pending[1] != normalized:
+            raise benchmark.BenchmarkSubmissionError(
+                "This benchmark report is no longer available. Run it again before submitting."
+            )
+        expires_at, saved_report, in_flight = pending
+        if in_flight:
+            raise benchmark.BenchmarkSubmissionError("This benchmark report is already being submitted.")
+        _PENDING_BENCHMARK_REPORTS[package_id] = (expires_at, saved_report, True)
+    return normalized
+
+
+def _release_benchmark_report(package_id: str) -> None:
+    """Allow retry after a visible outbound failure, provided the preview has not expired."""
+    now = time.monotonic()
+    with _PENDING_BENCHMARK_REPORTS_LOCK:
+        _prune_pending_benchmark_reports(now)
+        pending = _PENDING_BENCHMARK_REPORTS.get(package_id)
+        if pending is not None:
+            expires_at, saved_report, _in_flight = pending
+            _PENDING_BENCHMARK_REPORTS[package_id] = (expires_at, saved_report, False)
+
+
+def _consume_benchmark_report(package_id: str) -> None:
+    """Forget an acknowledged report so every submission remains one shot."""
+    with _PENDING_BENCHMARK_REPORTS_LOCK:
+        _PENDING_BENCHMARK_REPORTS.pop(package_id, None)
+
+
+def _discard_pending_benchmark_reports() -> None:
+    """Forget previews when consent is revoked; the next contribution starts fresh."""
+    with _PENDING_BENCHMARK_REPORTS_LOCK:
+        _PENDING_BENCHMARK_REPORTS.clear()
+
+
+def _set_benchmark_submission_enabled(enabled: bool) -> None:
+    """Persist the profile-local consent bit; it never starts collection or auto-sends reports."""
+    config = config_mod.load_config()
+    telemetry = config.setdefault("telemetry", {})
+    telemetry.setdefault("local_model_benchmarks", {})["enabled"] = enabled
+    config_mod.save_config(config)
+
+
+def _benchmark_report(model_id: str) -> dict[str, Any]:
+    """Load, warm, and benchmark one already-staged model, returning only its safe report."""
+    gguf = _staged_gguf(model_id)
+    if gguf is None:
+        raise HTTPException(status_code=404, detail=f"{model_id} is not downloaded")
+    _require_model_engine(model_id, gguf)
+    running = _state_endpoint()
+    if running is None:
+        raise HTTPException(status_code=409, detail="Start the local runtime before running a benchmark")
+
+    # Explicitly load first, then the benchmark module performs and discards a warm-up response.
+    # The timed request therefore describes a ready model, not a cold disk/model-load event.
+    try:
+        benchmark.prepare_local_model(running, model_id)
+    except benchmark.BenchmarkSubmissionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    hit = catalog.find_entry_for_model(model_id)
+    entry, variant = hit if hit is not None else (None, None)
+    model_bytes = (variant.size_bytes if variant is not None
+                   else sum(path.stat().st_size for path in _inspection_parts(gguf)))
+    inspection = _lookup_inspection(gguf)
+    lookup_placement = str(inspection.get("lookup_placement") or "unknown").replace("-", "_")
+    lookup_bytes = int(inspection.get("lookup_table_bytes") or 0)
+    decision = presets.read_preset_decisions().get(model_id)
+    budget = hardware.probe_budget(planning=True)
+    ram_total, _ram_available = hardware._ram_bytes()
+    engine_tag = running.get("engine_tag")
+    backend = _installed_backend(str(engine_tag)) if isinstance(engine_tag, str) else None
+
+    try:
+        return benchmark.run_benchmark(
+            server=running,
+            model_id=model_id,
+            catalog_id=entry.id if entry is not None else None,
+            quant=variant.quant if variant is not None else None,
+            model_bytes=model_bytes,
+            lookup_placement=lookup_placement,
+            lookup_table_bytes=lookup_bytes,
+            engine_tag=engine_tag if isinstance(engine_tag, str) else None,
+            backend=backend,
+            preset=decision.keys if decision is not None else None,
+            ordinary_memory_spill=bool(decision and decision.spilled),
+            device_memory_bytes=budget.total_device_bytes,
+            system_memory_bytes=ram_total,
+            unified_memory=budget.uma,
+        )
+    except benchmark.BenchmarkSubmissionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/api/local-models/benchmark")
+async def local_models_benchmark(body: BenchmarkRunBody):
+    """Run one fixed local benchmark.  This action never uploads anything by itself."""
+    if not _BENCHMARK_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A local benchmark is already running")
+    try:
+        try:
+            report = await run_in_threadpool(_benchmark_report, body.model_id)
+            report = _remember_benchmark_report(report)
+        except benchmark.BenchmarkSubmissionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "report": report,
+            "submission_enabled": benchmark.submission_enabled(_load_config()),
+        }
+    finally:
+        _BENCHMARK_LOCK.release()
+
+
+@router.post("/api/local-models/benchmark/consent")
+def local_models_benchmark_consent(body: BenchmarkConsentBody):
+    """Store or revoke consent.  Revocation stops future manual submissions immediately."""
+    _set_benchmark_submission_enabled(body.enabled)
+    if not body.enabled:
+        _discard_pending_benchmark_reports()
+    return {"enabled": body.enabled}
+
+
+@router.post("/api/local-models/benchmark/submit")
+async def local_models_benchmark_submit(body: BenchmarkSubmitBody):
+    """Submit exactly the report the person just reviewed, never an implicit post-install event."""
+    config = _load_config()
+    consented = benchmark.submission_enabled(config)
+    if not consented and not body.enable_submission:
+        raise HTTPException(status_code=403, detail="Review the report and explicitly enable benchmark submission first")
+    try:
+        endpoint = benchmark.submission_endpoint(config)
+        report = _reserve_benchmark_report(body.report)
+        try:
+            report = await run_in_threadpool(benchmark.submit_report, report, endpoint=endpoint)
+        except Exception:
+            _release_benchmark_report(report["package_id"])
+            raise
+    except benchmark.BenchmarkSubmissionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - a failed network request must remain visible to the person
+        logger.warning("local benchmark submission failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not submit the benchmark report") from exc
+    _consume_benchmark_report(report["package_id"])
+    if not consented and body.enable_submission:
+        _set_benchmark_submission_enabled(True)
+    return {"ok": True, "package_id": report["package_id"]}
 
 
 # ── catalog: priced for THIS machine before download ─────────

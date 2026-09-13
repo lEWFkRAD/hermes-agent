@@ -2,9 +2,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter, useLocation } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { HFFileGroup, HFSearchHit, LocalModelBenchmarkReport } from '@/api/local-models'
 import { I18nProvider } from '@/i18n'
 import { $localRuntimeJobs } from '@/store/local-runtime-jobs'
-import type { HFFileGroup, HFSearchHit } from '@/api/local-models'
 import type { LocalCatalogModel, LocalHardware, LocalModelsStatus, LocalRuntimeJob } from '@/types/hermes'
 
 import { LocalModelsSettings } from './local-models-settings'
@@ -26,8 +26,11 @@ vi.mock('@/hermes', () => ({
   installLocalRuntime: vi.fn(),
   listHFRepoFiles: vi.fn(),
   quickstartLocalModels: vi.fn(),
+  runLocalModelBenchmark: vi.fn(),
   searchHFModels: vi.fn(),
+  setLocalModelBenchmarkConsent: vi.fn(),
   sideloadLocalModel: vi.fn(),
+  submitLocalModelBenchmark: vi.fn(),
   unpublishLocalGatewayRoute: vi.fn()
 }))
 
@@ -159,11 +162,107 @@ afterEach(() => {
 })
 
 describe('LocalModelsSettings', () => {
+  it('keeps an active model benchmark local until its reviewed report is explicitly confirmed', async () => {
+    const report: LocalModelBenchmarkReport = {
+      benchmark: {
+        completion_tokens: 32,
+        completion_tokens_per_second: 48.6,
+        prompt_tokens: 12,
+        prompt_tokens_per_second: 120.4,
+        request: 'short-generation-v1',
+        wall_time_ms: 792
+      },
+      created_at: '2026-09-12T20:00:00+00:00',
+      hardware: {
+        device_memory_bytes: 96 * 2 ** 30,
+        system_memory_bytes: 256 * 2 ** 30,
+        unified_memory: false
+      },
+      model: {
+        family: 'qwen3.8-flash-next',
+        lookup_placement: 'disk_backed',
+        lookup_table_bytes: 28_800_138_240,
+        quant: 'UD-Q4_K_XL',
+        weights_bytes: 111_323_630_080
+      },
+      package_id: 'b2cc54eb-c2b1-4b84-9c54-8b506ba52b2e',
+      runtime: {
+        backend: 'cuda',
+        context_tokens: 131_072,
+        engine: 'llama.cpp',
+        engine_tag: 'b10679',
+        kv_cache: 'q8_0',
+        ordinary_memory_spill: false,
+        slots: 1,
+        speculation: 'mtp'
+      },
+      schema_version: 'hermes.local_model_benchmark.v1'
+    }
+
+    const modelId = 'Qwen3.8-Flash-Next-UD-Q4_K_XL'
+
+    mocked.getLocalModelsStatus.mockResolvedValue({
+      ...BASE_STATUS,
+      active_model_id: modelId,
+      models: [
+        {
+          disk_backed_lookup_bytes: 28_800_138_240,
+          id: modelId,
+          lookup_placement: 'disk-backed',
+          lookup_table_bytes: 28_800_138_240,
+          size_bytes: 111_323_630_080,
+          size_label: '103.7 GB'
+        }
+      ],
+      runtime_installed: true,
+      server_running: true
+    })
+    mocked.getLocalCatalog.mockResolvedValue({ models: [] })
+    mocked.runLocalModelBenchmark.mockResolvedValue({ report, submission_enabled: false })
+    mocked.submitLocalModelBenchmark.mockResolvedValue({ ok: true, package_id: report.package_id })
+
+    renderPane()
+
+    const run = await screen.findByRole('button', { name: 'Run benchmark' })
+
+    expect(mocked.runLocalModelBenchmark).not.toHaveBeenCalled()
+    expect(mocked.submitLocalModelBenchmark).not.toHaveBeenCalled()
+
+    fireEvent.click(run)
+
+    await waitFor(() => expect(mocked.runLocalModelBenchmark).toHaveBeenCalledWith(modelId))
+    expect(await screen.findByText('Benchmark results')).toBeTruthy()
+    expect(screen.getByText(/qwen3\.8-flash-next.*UD-Q4_K_XL.*weights.*lookup table/i)).toBeTruthy()
+    expect(screen.getByText(/short-generation-v1.*12 prompt tokens.*32 generated tokens/i)).toBeTruthy()
+    expect(screen.getByText(/prompt or generated text/i)).toBeTruthy()
+
+    const submit = screen.getByRole('button', { name: 'Submit report' })
+
+    expect(mocked.submitLocalModelBenchmark).not.toHaveBeenCalled()
+    fireEvent.click(submit)
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    // Radix marks the pane aria-hidden while the confirmation dialog owns focus;
+    // inspect the underlying control explicitly to prove a re-run cannot swap the
+    // reviewed report before confirmation.
+    expect((screen.getByRole('button', { hidden: true, name: 'Run benchmark' }) as HTMLButtonElement).disabled).toBe(
+      true
+    )
+    expect(mocked.runLocalModelBenchmark).toHaveBeenCalledTimes(1)
+
+    const confirm = screen.getAllByRole('button', { name: 'Submit report' }).at(-1)
+
+    expect(confirm).toBeTruthy()
+    fireEvent.click(confirm!)
+
+    await waitFor(() => expect(mocked.submitLocalModelBenchmark).toHaveBeenCalledWith(report, true))
+  })
+
   it('offers the runtime install with a plain-language explanation', async () => {
     await renderFullPane()
 
     expect(await screen.findByText('Install the local runtime')).toBeTruthy()
-    expect(screen.getByText(/runs? entirely on this machine/i)).toBeTruthy()
+    expect(screen.getByText(/models and chats stay on this machine/i)).toBeTruthy()
     expect(screen.getByRole('button', { name: /install runtime/i })).toBeTruthy()
   })
 

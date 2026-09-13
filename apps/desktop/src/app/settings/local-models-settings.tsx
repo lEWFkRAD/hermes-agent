@@ -56,6 +56,7 @@ import {
 import { notify, notifyError } from '@/store/notifications'
 import type { LocalCatalogModel, LocalHardware, LocalModelsStatus } from '@/types/hermes'
 
+import { LocalModelBenchmarkSubmission } from './local-model-benchmark-submission'
 import { ListRow, Pill, SettingsContent, SettingsSection, SettingsSkeleton } from './primitives'
 
 function ProgressBar({ percent }: { percent: number | undefined }) {
@@ -1335,6 +1336,11 @@ export function LocalModelsSettings() {
 
         {lastError?.kind === 'model-download' && <p className="text-[0.75rem] text-destructive">{lastError.error}</p>}
       </SettingsSection>
+
+      {/* Keyed by the active staged model: switching defaults unmounts any
+          in-flight benchmark view, so an old measurement can never appear
+          under the new model. */}
+      <LocalModelBenchmarkSubmission key={status.active_model_id ?? 'no-active-model'} status={status} />
 
       <BrowseSection onChanged={refresh} />
     </SettingsContent>

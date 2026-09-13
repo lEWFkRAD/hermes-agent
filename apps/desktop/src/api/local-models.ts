@@ -115,6 +115,78 @@ export function setLocalServer(action: 'start' | 'stop'): Promise<{ ok: boolean 
   })
 }
 
+// ── Explicit local benchmark contribution ───────────────────
+// This is deliberately not telemetry state: a person runs the local test,
+// reviews this closed payload, and confirms each submission themselves.
+
+export interface LocalModelBenchmarkReport {
+  schema_version: 'hermes.local_model_benchmark.v1'
+  package_id: string
+  created_at: string
+  model: {
+    family: string
+    quant: string
+    weights_bytes: number
+    lookup_placement: 'disk_backed' | 'none' | 'resident' | 'unknown'
+    lookup_table_bytes: number
+  }
+  runtime: {
+    engine: 'llama.cpp'
+    engine_tag: string
+    backend: 'cpu' | 'cuda' | 'hip' | 'metal' | 'unknown' | 'vulkan'
+    context_tokens: number
+    slots: number
+    kv_cache: 'f16' | 'q8_0' | 'unknown'
+    speculation: 'auto' | 'mtp' | 'off' | 'unknown'
+    ordinary_memory_spill: boolean
+  }
+  hardware: {
+    device_memory_bytes: number
+    system_memory_bytes: number
+    unified_memory: boolean
+  }
+  benchmark: {
+    request: 'short-generation-v1'
+    wall_time_ms: number
+    prompt_tokens: number
+    completion_tokens: number
+    prompt_tokens_per_second: null | number
+    completion_tokens_per_second: null | number
+  }
+}
+
+export function runLocalModelBenchmark(
+  modelId: string
+): Promise<{ report: LocalModelBenchmarkReport; submission_enabled: boolean }> {
+  return hermesApi({
+    ...profileScoped(),
+    body: { model_id: modelId },
+    method: 'POST',
+    path: '/api/local-models/benchmark'
+  })
+}
+
+export function submitLocalModelBenchmark(
+  report: LocalModelBenchmarkReport,
+  enableSubmission = false
+): Promise<{ ok: boolean; package_id: string }> {
+  return hermesApi({
+    ...profileScoped(),
+    body: { enable_submission: enableSubmission, report },
+    method: 'POST',
+    path: '/api/local-models/benchmark/submit'
+  })
+}
+
+export function setLocalModelBenchmarkConsent(enabled: boolean): Promise<{ enabled: boolean }> {
+  return hermesApi({
+    ...profileScoped(),
+    body: { enabled },
+    method: 'POST',
+    path: '/api/local-models/benchmark/consent'
+  })
+}
+
 export interface LocalAdvancedLaunchRequest {
   context_tokens: number | null
   slots: number

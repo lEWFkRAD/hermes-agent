@@ -1076,6 +1076,49 @@ export interface Translations {
       sideloadTitle: string
       sideloadDone: string
       sideloadAlreadyPresent: string
+      benchmarkTitle: string
+      benchmarkSubtitle: string
+      benchmarkRunTitle: string
+      benchmarkRun: string
+      benchmarkRunning: string
+      benchmarkRunDetail: (model: string) => string
+      benchmarkServerNeeded: string
+      benchmarkReportModelTitle: string
+      benchmarkReportRuntime: string
+      benchmarkReportHardwareTitle: string
+      benchmarkReportPlacementTitle: string
+      benchmarkReportResultsTitle: string
+      benchmarkReportWorkloadTitle: string
+      benchmarkReportMetaTitle: string
+      benchmarkReportModel: (family: string, quant: string, weights: string, lookup: string) => string
+      benchmarkReportConfig: (
+        engine: string,
+        context: string,
+        slots: number,
+        kvCache: string,
+        speculation: string
+      ) => string
+      benchmarkReportHardware: (deviceMemory: string, systemMemory: string, unifiedMemory: boolean) => string
+      benchmarkReportPlacement: (lookup: string, ordinaryMemorySpill: boolean) => string
+      benchmarkReportResult: (wallTimeMs: number, promptRate: string, completionRate: string) => string
+      benchmarkReportWorkload: (request: string, promptTokens: number, completionTokens: number) => string
+      benchmarkReportMeta: (packageId: string, createdAt: string, schemaVersion: string) => string
+      benchmarkMemory: (gibibytes: number) => string
+      benchmarkRate: (tokensPerSecond: number) => string
+      benchmarkContext: (tokens: number) => string
+      benchmarkUnavailable: string
+      benchmarkNoLookup: string
+      benchmarkReviewTitle: string
+      benchmarkPrivacy: string
+      benchmarkSubmit: string
+      benchmarkSubmitting: string
+      benchmarkSubmitTitle: string
+      benchmarkSubmitDescription: string
+      benchmarkSubmitted: string
+      benchmarkFailed: string
+      benchmarkSharingEnabled: string
+      benchmarkStopSharing: string
+      benchmarkConsentStopped: string
       pillFullContext: (max: string) => string
       pillFullContextTip: string
       pillUpTo: (max: string) => string

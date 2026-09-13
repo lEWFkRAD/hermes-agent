@@ -58,6 +58,11 @@ This choice is read from the profile's own `config.yaml`. A machine-managed
 configuration overlay cannot enable or disable shared metrics on the profile's
 behalf.
 
+> **Separate local-model benchmarks:** the optional Local Models benchmark is
+> not part of Relay shared metrics. It has its own
+> `telemetry.local_model_benchmarks` setting and each report is manually run,
+> reviewed, and confirmed before it can leave the machine.
+
 Relay plugin activation is owned by the native runtime and remains explicitly
 opt-in. Set `HERMES_NEMO_RELAY_PLUGINS_TOML` to a selected `plugins.toml` to
 activate configured middleware, exporters, or dynamic plugins. When the

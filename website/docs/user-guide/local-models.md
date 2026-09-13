@@ -1,7 +1,7 @@
 ---
 sidebar_position: 4
 title: Local Models
-description: Run models entirely on your own machine — no account, no API key, nothing leaves your computer.
+description: Run models on your own machine by default — no account or API key required. Optional benchmark reports leave only after your review and confirmation.
 ---
 
 # Local Models
@@ -13,8 +13,10 @@ manages the inference engine (llama.cpp), picks a curated build for your
 hardware, and handles memory on the default path. You pick a model; Hermes
 does the rest.
 
-Nothing leaves your computer: no account, no API key, and no network access
-after a model is downloaded.
+Nothing leaves your computer by default: no account, no API key, and no
+network access after a model is downloaded. The only exception is an optional
+one-shot benchmark report that you explicitly run, review, and submit; it is
+off by default and never runs on its own.
 
 ## Getting started
 
@@ -84,6 +86,64 @@ with a validated Hermes recipe. Applying a changed plan waits for the selected
 managed runtime to become idle and restarts it only then. Automatic
 window growth remains the default when no explicit context is configured.
 
+## Optional benchmark contribution
+
+If you want to contribute a comparable result for an installed local model,
+the **Local Models** screen can run one fixed, short benchmark. This is a
+separate feature from shared metrics and is disabled by default. It does not
+run after a download, install, activation, chat, or runtime restart.
+
+You must start the benchmark yourself while the local runtime is running.
+Hermes warms the selected model, runs a fixed short generation, and discards
+both generated responses. It then shows the resulting report in the Local
+Models screen. Nothing is sent merely by running the test: you must review the
+report, choose **Submit**, and confirm the submission. Even after you have
+allowed submissions once, every later report still needs its own manual run,
+review, Submit click, and confirmation. Hermes does not collect these results
+in the background or queue an automatic upload.
+
+### Exactly what the report contains
+
+The report has a closed allowlist, which Hermes validates again immediately
+before it is sent. It contains only:
+
+- The fixed test kind, elapsed time, prompt/completion token counts, and
+  prompt/completion tokens per second.
+- Total device memory, total system memory, and whether memory is unified.
+- The model family (or `sideloaded`), quant, total weight bytes, lookup-table
+  bytes, and lookup placement.
+- The llama.cpp build and backend; selected context, slots, KV cache, and
+  speculative-decoding settings; and whether ordinary model weights spill into
+  system RAM.
+- A random per-report package ID, timestamp, and schema version.
+
+It does **not** include the prompt or generated text, a model file, repository,
+or local path, your hostname or user name, GPU/CPU names or serial numbers, IP
+address, account details, credentials, chat history, or a raw copy of your
+configuration.
+
+The configured endpoint must use HTTPS (loopback HTTP is accepted only for
+local testing), and it is visible in your profile configuration rather than
+being supplied through an environment variable.
+
+### Stop or revoke sharing
+
+After a successful first submission, Hermes records profile-local consent so
+the screen can show that sharing is enabled. Choose **Stop sharing** in Local
+Models, or set the following value to `false`, to revoke that saved consent:
+
+```yaml
+telemetry:
+  local_model_benchmarks:
+    enabled: false
+    # endpoint: https://telemetry.nousresearch.com/v1/telemetry
+```
+
+Revoking consent stops the enabled state immediately; it does not affect a
+report you already chose to send. A later contribution requires a new local
+benchmark, a fresh review, and another explicit confirmation. This setting is
+independent of `telemetry.shared_metrics`.
+
 ## The status bar
 
 Right-click the status bar and enable **System resources** to see live GPU
@@ -127,7 +187,7 @@ local_runtime:
   enabled: false     # true = start the managed server with Hermes.
                      # The desktop "Use" button sets this automatically.
   backend: auto      # auto | cuda | metal | vulkan | hip | cpu
-  tag: b10362        # pinned llama.cpp release; Hermes updates it with
+  tag: b10679        # pinned llama.cpp release; Hermes updates it with
                      # each release after re-validation
   launch_overrides:  # optional per-staged-model advanced settings
     My-Local-GGUF:

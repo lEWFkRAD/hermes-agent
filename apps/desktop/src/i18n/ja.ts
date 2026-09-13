@@ -1041,7 +1041,7 @@ export const ja = defineLocale({
         `ビルド ${tag}、${backend} バックエンド。サーバーは Hermes が起動・管理します。`,
       installTitle: 'ローカルランタイムをインストール',
       installDetail:
-        'llama.cpp 推論エンジン（数百 MB）をダウンロードします。ダウンロードしたモデルはすべてこのマシン上で動作します——アカウント不要、データが外部に送られることはありません。',
+        'llama.cpp 推論エンジン（数百 MB）をダウンロードします。モデルとチャットはこのマシンに留まり、確認して明示的に送信したベンチマークレポートだけが外部に送られます。',
       installAction: 'ランタイムをインストール',
       installing: 'ランタイムをインストール中…',
       installFailed: 'ランタイムのインストールに失敗しました',
@@ -1145,6 +1145,52 @@ export const ja = defineLocale({
       sideloadTitle: 'GGUF モデルファイルを選択',
       sideloadDone: '{name} を追加しました。',
       sideloadAlreadyPresent: '既にライブラリにあります。',
+      benchmarkTitle: 'ローカルベンチマークを共有',
+      benchmarkSubtitle: '短いローカルテストを実行し、レポートを確認してから送信するか選びます。自動送信はされません。',
+      benchmarkRunTitle: 'ベンチマークを実行',
+      benchmarkRun: 'ベンチマークを実行',
+      benchmarkRunning: 'ベンチマークを実行中…',
+      benchmarkRunDetail: model => `${model} を短いローカル生成テストで測定します。`,
+      benchmarkServerNeeded: 'ベンチマークを実行するにはローカルサーバーを起動してください。',
+      benchmarkReportModelTitle: 'モデル',
+      benchmarkReportRuntime: 'ランタイム',
+      benchmarkReportHardwareTitle: 'ハードウェア',
+      benchmarkReportPlacementTitle: 'メモリ配置',
+      benchmarkReportResultsTitle: 'ベンチマーク結果',
+      benchmarkReportWorkloadTitle: 'テスト内容',
+      benchmarkReportMetaTitle: 'レポート',
+      benchmarkReportModel: (family, quant, weights, lookup) =>
+        `${family} · ${quant} · 重み ${weights} · ルックアップテーブル ${lookup}`,
+      benchmarkReportConfig: (engine, context, slots, kvCache, speculation) =>
+        `${engine} · コンテキスト ${context} · ${slots} スロット · KV ${kvCache} · ${speculation}`,
+      benchmarkReportHardware: (deviceMemory, systemMemory, unifiedMemory) =>
+        `${deviceMemory} デバイスメモリ · ${systemMemory} システムメモリ${unifiedMemory ? ' · ユニファイドメモリ' : ''}`,
+      benchmarkReportPlacement: (lookup, ordinaryMemorySpill) =>
+        `${lookup} · ${ordinaryMemorySpill ? 'システムメモリを使用' : '通常のメモリスピルなし'}`,
+      benchmarkReportResult: (wallTimeMs, promptRate, completionRate) =>
+        `${wallTimeMs.toLocaleString()} ms · プロンプト ${promptRate} · 生成 ${completionRate}`,
+      benchmarkReportWorkload: (request, promptTokens, completionTokens) =>
+        `${request} · プロンプト ${promptTokens.toLocaleString()} トークン · 生成 ${completionTokens.toLocaleString()} トークン`,
+      benchmarkReportMeta: (packageId, createdAt, schemaVersion) =>
+        `一回限りのレポート ${packageId} · 作成 ${createdAt} · ${schemaVersion}`,
+      benchmarkMemory: gibibytes => `${gibibytes.toFixed(1)} GB`,
+      benchmarkRate: tokensPerSecond => `${tokensPerSecond.toFixed(1)} tok/s`,
+      benchmarkContext: tokens => `${Math.round(tokens / 1024)}K`,
+      benchmarkUnavailable: '—',
+      benchmarkNoLookup: '参照テーブルなし',
+      benchmarkReviewTitle: '共有前に確認',
+      benchmarkPrivacy:
+        '一回限りのレポート ID と作成時刻、モデルのファミリー／量子化、重みと参照テーブルのサイズ／配置、ランタイムのビルド／設定、デバイス／システムメモリ量、ベンチマーク時間・トークン数・速度のみを含みます。プロンプトや生成テキスト、チャット、ファイル、パス、ホスト名、アカウント、エイリアス、永続的なインストール ID は決して含まれません。',
+      benchmarkSubmit: 'レポートを送信',
+      benchmarkSubmitting: 'レポートを送信中…',
+      benchmarkSubmitTitle: 'このベンチマークレポートを送信しますか？',
+      benchmarkSubmitDescription:
+        '確認した一回限りのレポート ID と作成時刻、モデルのファミリー／量子化、重みと参照テーブルのサイズ／配置、ランタイムのビルド／設定、デバイス／システムメモリ量、ベンチマーク時間・トークン数・速度のみを送信します。プロンプトや生成テキスト、チャット、ファイル、パス、ホスト名、アカウント、エイリアス、永続的なインストール ID は決して含まれません。今後のレポートでも確認が必要です。',
+      benchmarkSubmitted: 'ベンチマークレポートを送信しました。',
+      benchmarkFailed: 'ベンチマークを実行または送信できませんでした',
+      benchmarkSharingEnabled: '手動共有が有効',
+      benchmarkStopSharing: '送信への同意をオフにする',
+      benchmarkConsentStopped: 'ベンチマーク送信への同意をオフにしました。',
       pillFullContext: max => `フル ${max} コンテキスト`,
       pillFullContextTip: '最初からモデルの完全なコンテキストウィンドウで動作します',
       pillUpTo: max => `最大 ${max} コンテキスト`,
