@@ -29,9 +29,6 @@ class TestDecodeModifiedKeySequences:
 
     def test_kitty_csi_u_shift_only(self):
         assert decode_modified_key_sequences(f"{ESC}[84;2u") == "T"
-        # Kitty press/repeat low bits: shift|press(1)+1=3, shift|release+1=4.
-        assert decode_modified_key_sequences(f"{ESC}[84;3u") == "T"
-        assert decode_modified_key_sequences(f"{ESC}[84;4u") == "T"
 
     def test_control_and_alt_combos_pass_through(self):
         # Ctrl+T (5), Ctrl+Shift+T (6), Super+T (12) — decoding would invent
@@ -43,6 +40,12 @@ class TestDecodeModifiedKeySequences:
             assert decode_modified_key_sequences(seq) == seq
         assert decode_modified_key_sequences(f"{ESC}[27;3;84~") == f"{ESC}[27;3;84~"
         assert decode_modified_key_sequences(f"{ESC}[84;6u") == f"{ESC}[84;6u"
+
+    def test_kitty_alt_combinations_pass_through(self):
+        # CSI-u encodes Alt as 3 and Shift+Alt as 4; neither is shift-only.
+        for mod in ("3", "4"):
+            seq = f"{ESC}[84;{mod}u"
+            assert decode_modified_key_sequences(seq) == seq
 
     def test_lock_bits_pass_through(self):
         # CapsLock is applied by modifyOtherKeys *before* encoding: 65

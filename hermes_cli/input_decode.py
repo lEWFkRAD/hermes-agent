@@ -29,22 +29,16 @@ from typing import Callable
 
 __all__ = ["decode_modified_key_sequences", "safe_input"]
 
-# Shift-only modifier values per protocol.  The modifier parameter is a bitmask
-# plus one: shift=1, alt=2, ctrl=4, super=8, hyper=16, meta=32, caps=64, num=128.
-# Both protocols therefore report a plain Shift combo as 2 (0b01 + 1).  Kitty
-# additionally ORs the *event type* into the low bits only in *alternate*
-# report mode (press=+0/repeat=+1/release=+2), so there the release/repeat
-# forms of Shift+key arrive as 3 and 4.
+# The modifier parameter is a bitmask plus one: shift=1, alt=2, ctrl=4,
+# super=8, hyper=16, meta=32, caps=64, num=128. Plain Shift is therefore
+# exactly 2. In particular, Kitty CSI-u mod 3 is Alt and mod 4 is Shift+Alt;
+# neither is safe to turn into a literal character.
 #
 # Under modifyOtherKeys the terminal applies CapsLock/NumLock *before*
 # encoding (shift+caps on 'T' sends codepoint 116 = 't'), so the caps/num
 # bits are not lock noise — 65/129 are genuinely un-shifted keys and must
-# pass through untouched.  Decoding only happens for the exact shift-only
-# modifiers 2 (both protocols) and 3/4 (Kitty alternate report mode).
-_SHIFT_ONLY_MODS = frozenset({2, 3, 4})
-# modifyOtherKeys never encodes event type in the modifier, so there only the
-# exact shift value (2) is safe to decode — mod 3 is genuinely Alt.
-_EXACT_SHIFT_MODS = frozenset({2})
+# pass through untouched.
+_SHIFT_ONLY_MODS = frozenset({2})
 
 # modifyOtherKeys level-2: ESC [ 27 ; <mod> ; <codepoint> ~
 _MODIFY_OTHER_KEYS_RE = re.compile(r"\x1b\[27;(\d+);(\d+)~")
@@ -99,11 +93,9 @@ def decode_modified_key_sequences(text: str) -> str:
     * ``ESC[27;<mod>;<codepoint>~`` (modifyOtherKeys level 2) decodes to
       ``chr(codepoint)`` when ``<mod>`` is exactly 2 — the shared encoding
       both protocols use for a plain Shift combo.
-    * ``ESC[<codepoint>;<mod>u`` (Kitty CSI-u) additionally decodes ``<mod>``
-      3/4, the press/repeat-shifted forms Kitty's *alternate* report mode
-      produces by ORing the event type into the modifier.  Alt+T under
-      modifyOtherKeys (also mod 3) has no event bits to disambiguate from and
-      therefore passes through — never decode Alt there.
+    * ``ESC[<codepoint>;<mod>u`` (Kitty CSI-u) decodes only the same exact
+      Shift modifier (2). Modifiers 3 (Alt) and 4 (Shift+Alt) pass through
+      untouched, as do all other non-Shift combinations.
     * Functional keys (Kitty private-use plane 57344-63743, incl. Shift+Enter
       at 57427), control codepoints (<32/127), lock-bit combos (CapsLock is
       applied to the codepoint before encoding), other modifiers, and all
@@ -112,7 +104,7 @@ def decode_modified_key_sequences(text: str) -> str:
     if not text or "\x1b[" not in text:
         return text
     text = _MODIFY_OTHER_KEYS_RE.sub(
-        lambda m: _shift_char(m, 1, 2, _EXACT_SHIFT_MODS), text
+        lambda m: _shift_char(m, 1, 2, _SHIFT_ONLY_MODS), text
     )
     text = _KITTY_CSI_U_RE.sub(
         lambda m: _shift_char(m, 2, 1, _SHIFT_ONLY_MODS), text
