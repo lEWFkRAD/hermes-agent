@@ -82,6 +82,7 @@ _ENGINE_TAG_RE = re.compile(r"^b[0-9]+$")
 _DOWNLOAD_CONNECTIONS = 8
 _CHUNK = 4 << 20
 _SERVER_START_FAILED = "The local server could not start — check the runtime is installed"
+_AGENT_PIPELINE_SCHEMA_VERSION = "hermes.local_models.agent_pipeline.v1"
 # Header inspection is fast, but the pane polls status every few seconds and a multi-shard model's
 # metadata can still be sizeable. Cache only immutable (path, size, mtime, active engine) snapshots.
 _LOOKUP_INSPECTION_CACHE: Dict[tuple, Dict[str, Any]] = {}
@@ -1077,6 +1078,312 @@ def _benchmark_report(model_id: str) -> dict[str, Any]:
         )
     except benchmark.BenchmarkSubmissionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _local_models_agent_pipeline() -> dict[str, Any]:
+    """Describe the complete managed-local-model path for trusted integrations.
+
+    This intentionally teaches policy and verified API contracts without adding
+    a model-callable control surface.  An integration still needs a
+    user-controlled confirmation bridge for every destructive, networked, or
+    privacy-sensitive action.
+    """
+    from hermes_cli.local_runtime.gguf import (
+        AUTOMATIC_LAZY_TENSOR_THRESHOLD_BYTES,
+        LAZY_LOOKUP_MIN_ENGINE_BUILD,
+    )
+
+    return {
+        "schema_version": _AGENT_PIPELINE_SCHEMA_VERSION,
+        "purpose": (
+            "Guide a person through Hermes-managed local models: compatible "
+            "runtime, complete GGUF download, PLE/Engram lookup placement, "
+            "typed launch tuning, optional gateway publishing, and voluntary "
+            "benchmark contribution."
+        ),
+        "authority": {
+            "instructions_only": True,
+            "only_act_on_explicit_user_request": True,
+            "no_background_download_or_runtime_update": True,
+            "no_model_callable_benchmark_submit": True,
+            "write_actions_need_a_user_controlled_confirmation_bridge": True,
+        },
+        "scope": {
+            "shipping_target": "Qwen3.8 Flash Next PLE through supported llama.cpp",
+            "not_in_catalog": "DeepSeek V4.1 / Engram until a runtime can serve it",
+        },
+        "read_first": [
+            {
+                "request": {"method": "GET", "path": "/api/local-models/status"},
+                "read": [
+                    "tag",
+                    "configured_tag",
+                    "serving_tag",
+                    "runtime_installed",
+                    "server_running",
+                    "active_model_id",
+                    "models",
+                    "placement",
+                ],
+            },
+            {
+                "request": {"method": "GET", "path": "/api/local-models/hardware"},
+                "read": [
+                    "uma",
+                    "vram_usable_bytes",
+                    "ram_available_bytes",
+                ],
+            },
+            {
+                "request": {"method": "GET", "path": "/api/local-models/catalog"},
+                "read": [
+                    "models[].recommended",
+                    "models[].needs_engine",
+                    "models[].min_engine",
+                    "models[].model_id",
+                    "models[].quant",
+                    "models[].size_bytes",
+                    "models[].spilled",
+                    "models[].disk_backed_lookup_bytes",
+                ],
+            },
+        ],
+        "ple_engram_lookup": {
+            "tensor": "per_layer_token_embd.weight",
+            "split_gguf": {
+                "complete_variant_required": True,
+                "rule": (
+                    "Require every shard. Read model metadata from part 1 and "
+                    "aggregate tensor tables and bytes across all shards; do not "
+                    "infer a model's footprint from shard 1."
+                ),
+            },
+            "automatic_disk_backed_rule": {
+                "supported_tensor_names": ["per_layer_token_embd.weight"],
+                "minimum_llama_cpp_build": f"b{LAZY_LOOKUP_MIN_ENGINE_BUILD}",
+                "tensor_bytes": AUTOMATIC_LAZY_TENSOR_THRESHOLD_BYTES,
+                "comparison": "strictly_greater_than",
+                "scope": (
+                    "Apply the threshold to that exact named tensor's computed "
+                    "GGML byte length, not total lookup bytes, split-file bytes, "
+                    "or arbitrary oversized tensors."
+                ),
+                "unsupported_lookup_tensors": (
+                    "No other Engram tensor name receives automatic disk-backed "
+                    "placement in this release."
+                ),
+                "engine_fact": (
+                    "Live disk-backed placement is proven only by a non-null "
+                    "status.serving_tag and parsed lookup_placement. Never use "
+                    "status.tag or configured_tag when a live state lacks its "
+                    "serving tag. Without a running server, use only the verified "
+                    "next-boot build; never assume a configured-but-pending build "
+                    "is active."
+                ),
+            },
+            "placement_values": {
+                "disk-backed": (
+                    "The supported llama.cpp build reads the oversized lookup "
+                    "table on demand through mmap. It is not fully GPU-resident "
+                    "and is not ordinary system-RAM spill."
+                ),
+                "resident": (
+                    "The lookup table is at or below the strict 4 GiB threshold "
+                    "and remains ordinary resident weight memory."
+                ),
+                "requires-engine-update": (
+                    "The GGUF has an eligible oversized lookup table but the "
+                    "actual engine cannot safely use automatic disk-backed placement."
+                ),
+                "none": "The GGUF has no recognized PLE lookup tensor.",
+                "unknown": "The completed GGUF could not be safely inspected.",
+            },
+        },
+        "quantization": {
+            "rule": (
+                "Use the selected published GGUF quant as a complete variant; "
+                "the managed path does not re-quantize local files."
+            ),
+            "lookup_table": (
+                "The table's quant is part of that GGUF. Re-check its exact "
+                "post-download tensor bytes against the strict lazy threshold."
+            ),
+        },
+        "placement_accounting": {
+            "initial_fit_and_ordinary_spill": "resident weights plus runtime/KV overhead",
+            "context_growth": "resident weights plus the next-rung KV refit against the live budget",
+            "download_size_and_decode_speed": "all downloaded tensor bytes",
+            "disk_backed_lookup": {
+                "does_not_set_spilled": True,
+                "does_not_use_cpu_tensor_override": True,
+                "must_not_be_described_as_fully_on_gpu": True,
+            },
+            "ordinary_dense_or_expert_spill": {
+                "sets_spilled": True,
+                "cpu_tensor_override": (
+                    "Only a genuine non-UMA spill adds an override pattern for "
+                    "MoE or recurrent weights; dense models use the normal fit "
+                    "layer cut and no explicit -ot pattern."
+                ),
+                "raw_llama_cpp_flags_are_not_agent_inputs": True,
+            },
+        },
+        "phases": [
+            {
+                "id": "choose_a_compatible_catalog_variant",
+                "action": (
+                    "Use the catalog recommendation and its exact planned quant. "
+                    "Treat a needs_engine/min_engine result as a hard gate, not a "
+                    "reason to bypass compatibility."
+                ),
+            },
+            {
+                "id": "install_or_update_runtime_when_the_user_approves",
+                "request": {
+                    "method": "POST",
+                    "path": "/api/local-models/runtime/install",
+                    "body_template": {"backend": "{optional backend}", "tag": "{required compatible tag}"},
+                },
+                "completion": "Poll GET /api/local-models/jobs/{job_id} until the job is terminal.",
+                "rule": "Never trigger this because a model merely exists on disk.",
+            },
+            {
+                "id": "download_the_complete_variant_when_the_user_approves",
+                "request": {
+                    "method": "POST",
+                    "path": "/api/local-models/download",
+                    "body_template": {"model_id": "{catalog family or exact variant id}"},
+                },
+                "completion": "Wait for the download job before treating a split GGUF as staged.",
+                "rule": "Download every split part selected by the catalog; do not use only shard 1.",
+            },
+            {
+                "id": "verify_post_download_placement",
+                "request": {"method": "GET", "path": "/api/local-models/status"},
+                "read": [
+                    "models[].lookup_placement",
+                    "models[].lookup_table_bytes",
+                    "models[].disk_backed_lookup_bytes",
+                    "models[].required_engine",
+                ],
+                "rule": (
+                    "The parsed completed GGUF is authoritative after download. "
+                    "If placement requires an engine update, stop and update the "
+                    "engine rather than launching it as ordinary spill."
+                ),
+            },
+            {
+                "id": "activate_and_run",
+                "request": {
+                    "method": "POST",
+                    "path": "/api/local-models/activate",
+                    "body_template": {"model_id": "{staged model id}"},
+                },
+                "completion": (
+                    "Poll GET /api/local-models/jobs/{job_id} until the activation "
+                    "job is terminal, then read status. Activation ensures the "
+                    "managed server is running."
+                ),
+                "rule": (
+                    "After activation, verify parsed file placement from "
+                    "status.models[].lookup_placement. status.placement becomes "
+                    "a live placement proof only after an inference loads the model; "
+                    "then it must use the actual serving engine tag, not a pending "
+                    "configured build."
+                ),
+            },
+            {
+                "id": "explicitly_start_or_stop_an_existing_runtime",
+                "only_if": "the user specifically asks to start or stop the already configured runtime",
+                "request": {
+                    "method": "POST",
+                    "path": "/api/local-models/server",
+                    "body_template": {"action": "{one allowed action}"},
+                    "allowed_actions": ["start", "stop"],
+                },
+                "rule": "Do not pair this with activation; activation already ensures a running server.",
+            },
+            {
+                "id": "plan_typed_launch_preferences",
+                "requests": [
+                    {
+                        "method": "POST",
+                        "path": "/api/local-models/advanced/plan",
+                        "body_template": {
+                            "model_id": "{staged model id}",
+                            "context_tokens": "{optional}",
+                            "slots": "{optional}",
+                            "kv_cache": "{optional}",
+                            "speculation": "{optional}",
+                            "mtp_draft_depth": "{optional}",
+                        },
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/local-models/advanced/apply",
+                        "body_template": (
+                            "the original typed plan request, including model_id, "
+                            "after it returns fits: true"
+                        ),
+                    },
+                ],
+                "rule": (
+                    "Preview first. Apply only a fitting typed plan after user "
+                    "approval; never construct raw llama.cpp flags."
+                ),
+            },
+            {
+                "id": "optionally_publish_a_gateway_alias",
+                "requests": [
+                    {"method": "GET", "path": "/api/local-models/gateway-routes"},
+                    {
+                        "method": "POST",
+                        "path": "/api/local-models/gateway-routes",
+                        "body_template": {
+                            "alias": "{user-chosen stable alias}",
+                            "model_id": "{staged model id}",
+                            "mode": "{one allowed mode}",
+                        },
+                        "allowed_modes": ["agent", "raw"],
+                    },
+                ],
+                "completion": "Tell the user that an explicit gateway restart is required.",
+                "mode_contract": {
+                    "agent": "A Hermes agent route with normal agent construction and controls.",
+                    "raw": "A fixed local llama.cpp chat-completions/streaming route, not an arbitrary upstream.",
+                },
+                "transport_rule": "Forward managed runtime credentials only to the validated loopback endpoint.",
+            },
+            {
+                "id": "optional_reviewed_benchmark_contribution",
+                "instructions_endpoint": "/api/local-models/benchmark/instructions",
+                "rule": (
+                    "This is opt-in and separate from installation. Follow the "
+                    "nested review-first contract; never run or submit it automatically."
+                ),
+            },
+        ],
+    }
+
+
+@router.get("/api/local-models/agent-instructions")
+def local_models_agent_instructions():
+    """Expose the whole local-model/PLE lifecycle to trusted assisting integrations."""
+    guide = _local_models_agent_pipeline()
+    guide["benchmark_contribution"] = benchmark.agent_pipeline_instructions(
+        submission_enabled=benchmark.submission_enabled(_load_config()),
+        preview_lifetime_seconds=_BENCHMARK_REPORT_TTL_SECONDS,
+    )
+    return guide
+
+
+@router.get("/api/local-models/benchmark/instructions")
+def local_models_benchmark_instructions():
+    """Expose the review-first benchmark workflow to local assisting agents."""
+    return benchmark.agent_pipeline_instructions(
+        submission_enabled=benchmark.submission_enabled(_load_config()),
+        preview_lifetime_seconds=_BENCHMARK_REPORT_TTL_SECONDS,
+    )
 
 
 @router.post("/api/local-models/benchmark")

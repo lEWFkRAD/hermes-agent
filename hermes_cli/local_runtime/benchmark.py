@@ -23,6 +23,7 @@ from hermes_cli.observability.shared_metrics_send_config import DEFAULT_ENDPOINT
 
 
 SCHEMA_VERSION = "hermes.local_model_benchmark.v1"
+AGENT_PIPELINE_SCHEMA_VERSION = "hermes.local_model_benchmark.agent_pipeline.v1"
 _WARMUP_PROMPT = "Reply with exactly the word ready."
 _BENCHMARK_PROMPT = (
     "Write the word Hermes exactly 32 times, separated by single spaces."
@@ -88,6 +89,95 @@ def submission_endpoint(config: Mapping[str, Any] | None) -> str:
             "Benchmark submission needs an HTTPS endpoint (localhost HTTP is allowed for testing)."
         )
     return endpoint
+
+
+def agent_pipeline_instructions(
+    *, submission_enabled: bool, preview_lifetime_seconds: int
+) -> dict[str, Any]:
+    """Return the safe, machine-readable workflow for an assisting agent.
+
+    This is deliberately guidance rather than an authorization mechanism.  A
+    previous opt-in does not let an agent submit a new result silently: each
+    report still needs to be shown to, and approved by, the person in the
+    current conversation.
+    """
+    return {
+        "schema_version": AGENT_PIPELINE_SCHEMA_VERSION,
+        "purpose": (
+            "Help a person voluntarily run and, only after review, contribute "
+            "one local-model benchmark report."
+        ),
+        "activation": {
+            "only_when_user_requests": True,
+            "automatic_after_installation": False,
+            "automatic_after_activation": False,
+            "automatic_after_chat": False,
+        },
+        "authorization": {
+            "guide_is_not_submission_authorization": True,
+            "trusted_confirmation_bridge_required": True,
+            "model_callable_submit": False,
+        },
+        "submission": {
+            "submission_enabled": bool(submission_enabled),
+            "requires_current_user_confirmation": True,
+            "confirmation_rule": (
+                "Show the exact report to the user, then wait for an explicit "
+                "yes before every outbound submission."
+            ),
+            "preview_lifetime_seconds": preview_lifetime_seconds,
+            "one_shot_after_success": True,
+        },
+        "report_contents": {
+            "included": [
+                "one-time report ID and timestamp",
+                "model family, quant, weights and lookup-table byte counts and placement",
+                "selected runtime configuration and generic memory totals",
+                "fixed-workload timing, token counts, and token rates",
+            ],
+            "excluded": [
+                "prompts and generated output",
+                "model aliases, repositories, and file paths",
+                "hostnames, account data, API keys, and persistent install identifiers",
+                "device names",
+            ],
+        },
+        "steps": [
+            {
+                "id": "inspect_local_runtime_readiness",
+                "request": {"method": "GET", "path": "/api/local-models/status"},
+                "read": ["active_model_id", "server_running"],
+                "require": [
+                    "server_running is true",
+                    "active_model_id is set",
+                ],
+            },
+            {
+                "id": "handoff_to_user_controlled_benchmark_flow",
+                "action": (
+                    "Open or direct the user to the Local Models benchmark card. "
+                    "That user-controlled surface runs the local test, renders the "
+                    "exact report, and owns the final Submit and confirmation click."
+                ),
+                "agent_may_call_submission_endpoints": False,
+            },
+            {
+                "id": "revoke_through_the_user_controlled_surface",
+                "only_if": "the user asks to stop future benchmark sharing",
+                "action": (
+                    "Use the Local Models card's Stop sharing control. Do not "
+                    "change saved benchmark consent directly from an agent."
+                ),
+            },
+        ],
+        "prohibitions": [
+            "Never submit automatically or in the background.",
+            "Never expose the submit endpoint as a model-callable tool without a trusted user-controlled confirmation bridge.",
+            "Never enable submission through the consent endpoint; enable it only as part of a reviewed, confirmed submission.",
+            "Never call benchmark, submit, or consent write endpoints directly from a generic agent.",
+            "Never alter, supplement, or rebuild the returned report.",
+        ],
+    }
 
 
 def _bounded_int(value: Any, *, ceiling: int, default: int = 0) -> int:

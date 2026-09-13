@@ -144,6 +144,17 @@ report you already chose to send. A later contribution requires a new local
 benchmark, a fresh review, and another explicit confirmation. This setting is
 independent of `telemetry.shared_metrics`.
 
+### Backend guide for assisting integrations
+
+Trusted local integrations can read `GET /api/local-models/agent-instructions`
+for the complete managed path: hardware and catalog inspection, compatible
+llama.cpp installation, complete split-GGUF download, PLE/Engram lookup-table
+placement, typed launch plans, gateway aliases, and the nested benchmark
+contract. It is a read-only guide, not an authorization to change settings or
+send data. In particular, an integration must not expose benchmark submission
+as a model-callable action; the user-controlled review and confirmation flow
+remains the required boundary.
+
 ## The status bar
 
 Right-click the status bar and enable **System resources** to see live GPU

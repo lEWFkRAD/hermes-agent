@@ -259,6 +259,99 @@ def test_submission_config_defaults_to_opt_out_and_rejects_nonlocal_http():
         })
 
 
+def test_backend_agent_guide_requires_review_and_current_confirmation(client, monkeypatch):
+    from hermes_cli.web_routers import local_models
+
+    monkeypatch.setattr(
+        local_models,
+        "_load_config",
+        lambda: {"telemetry": {"local_model_benchmarks": {"enabled": True}}},
+    )
+    before = dict(local_models._PENDING_BENCHMARK_REPORTS)
+
+    response = client.get("/api/local-models/benchmark/instructions")
+
+    assert response.status_code == 200
+    guide = response.json()
+    assert guide["schema_version"] == benchmark.AGENT_PIPELINE_SCHEMA_VERSION
+    assert guide["activation"]["only_when_user_requests"] is True
+    assert guide["activation"]["automatic_after_installation"] is False
+    assert guide["authorization"] == {
+        "guide_is_not_submission_authorization": True,
+        "trusted_confirmation_bridge_required": True,
+        "model_callable_submit": False,
+    }
+    assert guide["submission"]["submission_enabled"] is True
+    assert guide["submission"]["requires_current_user_confirmation"] is True
+    assert guide["submission"]["preview_lifetime_seconds"] == 15 * 60
+    step_ids = [step["id"] for step in guide["steps"]]
+    steps = {step["id"]: step for step in guide["steps"]}
+    assert steps["inspect_local_runtime_readiness"]["request"]["path"] == "/api/local-models/status"
+    assert steps["handoff_to_user_controlled_benchmark_flow"]["agent_may_call_submission_endpoints"] is False
+    assert step_ids.index("inspect_local_runtime_readiness") < step_ids.index(
+        "handoff_to_user_controlled_benchmark_flow"
+    )
+    serialized = json.dumps(guide)
+    assert "/api/local-models/benchmark/submit" not in serialized
+    assert "/api/local-models/benchmark/consent" not in serialized
+    assert "Never submit automatically or in the background." in guide["prohibitions"]
+    assert local_models._PENDING_BENCHMARK_REPORTS == before
+
+
+def test_full_backend_agent_guide_covers_the_ple_lifecycle(client):
+    from hermes_cli.local_runtime.gguf import LAZY_LOOKUP_MIN_ENGINE_BUILD
+    from hermes_cli.web_routers import local_models
+
+    before = dict(local_models._PENDING_BENCHMARK_REPORTS)
+    response = client.get("/api/local-models/agent-instructions")
+
+    assert response.status_code == 200
+    guide = response.json()
+    assert guide["schema_version"] == "hermes.local_models.agent_pipeline.v1"
+    assert guide["authority"]["only_act_on_explicit_user_request"] is True
+    assert guide["authority"]["no_model_callable_benchmark_submit"] is True
+    lookup = guide["ple_engram_lookup"]
+    assert lookup["tensor"] == "per_layer_token_embd.weight"
+    assert lookup["split_gguf"]["complete_variant_required"] is True
+    assert "metadata from part 1" in lookup["split_gguf"]["rule"]
+    assert lookup["automatic_disk_backed_rule"]["comparison"] == "strictly_greater_than"
+    assert lookup["automatic_disk_backed_rule"]["supported_tensor_names"] == [
+        "per_layer_token_embd.weight"
+    ]
+    assert lookup["automatic_disk_backed_rule"]["minimum_llama_cpp_build"] == (
+        f"b{LAZY_LOOKUP_MIN_ENGINE_BUILD}"
+    )
+    assert "does not re-quantize local files" in guide["quantization"]["rule"]
+    accounting = guide["placement_accounting"]
+    assert accounting["disk_backed_lookup"]["does_not_set_spilled"] is True
+    assert accounting["disk_backed_lookup"]["does_not_use_cpu_tensor_override"] is True
+    assert "dense models" in accounting["ordinary_dense_or_expert_spill"]["cpu_tensor_override"]
+    phase_ids = [phase["id"] for phase in guide["phases"]]
+    assert phase_ids.index("choose_a_compatible_catalog_variant") < phase_ids.index(
+        "download_the_complete_variant_when_the_user_approves"
+    )
+    assert phase_ids.index("download_the_complete_variant_when_the_user_approves") < phase_ids.index(
+        "verify_post_download_placement"
+    )
+    assert phase_ids.index("verify_post_download_placement") < phase_ids.index("activate_and_run")
+    activation = next(phase for phase in guide["phases"] if phase["id"] == "activate_and_run")
+    assert "status.models[].lookup_placement" in activation["rule"]
+    assert "after an inference loads the model" in activation["rule"]
+    server_control = next(
+        phase for phase in guide["phases"] if phase["id"] == "explicitly_start_or_stop_an_existing_runtime"
+    )
+    assert server_control["request"]["allowed_actions"] == ["start", "stop"]
+    advanced = next(phase for phase in guide["phases"] if phase["id"] == "plan_typed_launch_preferences")
+    assert "including model_id" in advanced["requests"][1]["body_template"]
+    gateway = next(phase for phase in guide["phases"] if phase["id"] == "optionally_publish_a_gateway_alias")
+    assert gateway["requests"][1]["allowed_modes"] == ["agent", "raw"]
+    assert gateway["mode_contract"]["raw"].startswith("A fixed local llama.cpp")
+    assert "loopback endpoint" in gateway["transport_rule"]
+    assert guide["benchmark_contribution"]["schema_version"] == benchmark.AGENT_PIPELINE_SCHEMA_VERSION
+    assert guide["benchmark_contribution"]["submission"]["requires_current_user_confirmation"] is True
+    assert local_models._PENDING_BENCHMARK_REPORTS == before
+
+
 def test_benchmark_prompt_cannot_be_routed_to_a_nonlocal_server():
     with pytest.raises(
         benchmark.BenchmarkSubmissionError, match="managed local server"
