@@ -1,3 +1,5 @@
+> **Chalkline product branch:** see [CHALKLINE.md](CHALKLINE.md) for the teacher desktop, connected student classroom, setup and limitations.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>

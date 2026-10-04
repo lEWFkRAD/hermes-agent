@@ -319,3 +319,8 @@ native/fts5_cjk/*.so
 /pm/.lock.json.lock
 
 apps/desktop/.dist-build*
+
+# Local Chalkline package, kept alongside the previous executable.
+/apps/desktop/release-current/
+
+/apps/desktop/release-classroom/

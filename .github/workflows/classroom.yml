@@ -1,0 +1,29 @@
+name: Connected classroom
+
+on:
+  push:
+    paths: ['apps/chalkline-classroom/**', '.github/workflows/classroom.yml']
+  pull_request:
+    paths: ['apps/chalkline-classroom/**', '.github/workflows/classroom.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  classroom:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/chalkline-classroom
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/chalkline-classroom/package-lock.json
+      - run: npm ci --workspaces=false
+      - run: npm test --workspaces=false
+      - run: npx --workspaces=false playwright install --with-deps chromium
+      - run: npm run test:browser --workspaces=false

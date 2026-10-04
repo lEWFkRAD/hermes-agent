@@ -75,7 +75,7 @@ async function stampExeIdentity(
   }
 
   // Icon lives at apps/desktop/assets/icon.ico
-  const icon = join(desktopRoot, 'assets', 'icon.ico')
+  const icon = join(desktopRoot, 'assets', 'chalkline.ico')
   if (!existsSync(icon)) {
     throw new Error(`icon not found: ${icon}`)
   }
@@ -86,10 +86,12 @@ async function stampExeIdentity(
   const options = {
     icon,
     'version-string': {
-      ProductName: 'Hermes',
-      FileDescription: 'Hermes',
-      CompanyName: 'Nous Research',
-      LegalCopyright: 'Copyright (c) 2026 Nous Research'
+      ProductName: 'Chalkline',
+      FileDescription: 'Chalkline teacher workspace',
+      CompanyName: 'Onyx Intelligence Systems',
+      InternalName: 'Chalkline',
+      OriginalFilename: 'Chalkline.exe',
+      LegalCopyright: 'Copyright (c) 2026 Onyx Intelligence Systems'
     }
   }
 
@@ -107,7 +109,7 @@ async function stampExeIdentity(
     }
   }
 
-  console.log('[set-exe-identity] done — Hermes icon + identity stamped')
+  console.log('[set-exe-identity] done — Chalkline icon + identity stamped')
 }
 
 export { RCEDIT_COMMIT_RETRY_DELAYS_MS, stampExeIdentity }

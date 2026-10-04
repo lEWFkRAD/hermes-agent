@@ -118,7 +118,7 @@ test('nonstable runtime pins userData before the app name can change', async ():
 })
 
 test.each([
-  [undefined, 'Hermes', 'hermes', 'latest', 'canary'],
+  [undefined, 'Chalkline', 'chalkline', null, null],
   ['bundled', 'Hermes Agent', 'hermes', 'latest', 'canary'],
   ['light', 'Hermes Light', 'hermes-light', 'light', 'light-canary']
 ] as const)(
@@ -127,8 +127,8 @@ test.each([
     variant: string | undefined,
     display: string,
     cli: string,
-    channel: string,
-    canaryChannel: string
+    channel: string | null,
+    canaryChannel: string | null
   ): Promise<void> => {
     const stable: ProductIdentity = await identityForVariant(variant)
     assert.equal(stable.displayName, display)
