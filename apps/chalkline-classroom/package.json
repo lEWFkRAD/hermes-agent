@@ -1,18 +1,8 @@
 {
-  "name": "chalkline-classroom",
-  "version": "0.1.0",
+  "name": "chalkline-classroom-bridge",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=22.16.0"
-  },
-  "scripts": {
-    "start": "node server.mjs",
-    "test": "node --test test/*.test.mjs",
-    "test:browser": "node test/browser-check.mjs",
-    "test:media": "node test/media-check.mjs"
-  },
-  "devDependencies": {
-    "@playwright/test": "1.62.1"
-  }
+  "engines": { "node": ">=24.11.0" },
+  "scripts": { "start": "node launcher.mjs" }
 }

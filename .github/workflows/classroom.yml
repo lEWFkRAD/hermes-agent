@@ -1,4 +1,4 @@
-name: Connected classroom
+name: Connected classroom compatibility
 
 on:
   push:
@@ -13,17 +13,31 @@ permissions:
 jobs:
   classroom:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/chalkline-classroom
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Read pinned service revision
+        id: source
+        run: |
+          node -e "const p=require('./apps/chalkline-classroom/source.lock.json');if(!/^[a-f0-9]{40}$/.test(p.commit))throw Error('Expected immutable commit');require('fs').appendFileSync(process.env.GITHUB_OUTPUT,'ref='+p.commit+'\n')"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: lEWFkRAD/onyx-chalkline
+          ref: ${{ steps.source.outputs.ref }}
+          path: shared-classroom
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: apps/chalkline-classroom/package-lock.json
+          cache-dependency-path: shared-classroom/classroom/package-lock.json
+      - name: Validate bridge contract
+        run: |
+          node --check apps/chalkline-classroom/launcher.mjs
+          node -e "const p=require('./shared-classroom/classroom/package.json');if(p.name!=='chalkline-classroom'||p.chalklineApiVersion!==2)throw Error('Incompatible service')"
       - run: npm ci --workspaces=false
+        working-directory: shared-classroom/classroom
       - run: npm test --workspaces=false
+        working-directory: shared-classroom/classroom
       - run: npx --workspaces=false playwright install --with-deps chromium
+        working-directory: shared-classroom/classroom
       - run: npm run test:browser --workspaces=false
+        working-directory: shared-classroom/classroom

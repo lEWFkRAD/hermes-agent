@@ -1,6 +1,15 @@
 import './chalkline.css'
 
-import { type HermesPlugin, host, PALETTE_AREA, type PaletteContribution, type RouteContribution, ROUTES_AREA, SIDEBAR_NAV_AREA, type SidebarNavContribution } from '@hermes/plugin-sdk'
+import {
+  type HermesPlugin,
+  host,
+  PALETTE_AREA,
+  type PaletteContribution,
+  type RouteContribution,
+  ROUTES_AREA,
+  SIDEBAR_NAV_AREA,
+  type SidebarNavContribution
+} from '@hermes/plugin-sdk'
 
 import { ChalklinePage } from './chalkline-page'
 import { CLASSROOM_LOCALES } from './classroom-locales'
@@ -8,7 +17,7 @@ import { CLASSROOM_LOCALES } from './classroom-locales'
 const plugin: HermesPlugin = {
   id: 'chalkline',
   name: 'Chalkline',
-  description: 'Private teacher workspace for planning, classroom evidence, student support, and reviewed district handoffs.',
+  description: 'Connected teacher classroom for reviewed lessons, student work, learning questions and feedback.',
   register(ctx) {
     ctx.i18n.register(CLASSROOM_LOCALES)
     ctx.registerMany([

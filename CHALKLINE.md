@@ -1,42 +1,39 @@
 # Chalkline teacher desktop and connected classroom
 
-This branch contains the Chalkline adaptation of Hermes at upstream snapshot `16bc0b6b94be7435cb63ed30923fbc7edd53f4c5` (2026-10-03). It preserves upstream history and licenses. It is a product branch, not a request to replace the general-purpose Hermes application.
+This branch contains the Chalkline adaptation of Hermes at upstream snapshot `16bc0b6b94be7435cb63ed30923fbc7edd53f4c5` (2026-10-03). It preserves upstream history and licenses. Chalkline uses its own app identity, profile and `chalkline://` links.
 
-## Run the classroom independently
+## One maintained classroom service
+
+The service lives in [onyx-chalkline/classroom](https://github.com/lEWFkRAD/onyx-chalkline/tree/main/classroom). This native branch consumes that service instead of maintaining a second database, tutor or browser app. The compatible source revision is recorded in [source.lock.json](apps/chalkline-classroom/source.lock.json).
+
+Clone both repositories and run the companion with Node.js 24.11+:
 
 ```sh
-cd apps/chalkline-classroom
-node server.mjs
+node apps/chalkline-classroom/launcher.mjs --source /path/to/onyx-chalkline/classroom --data /path/to/private-classroom-data
 ```
 
-Node.js 22.16+ is required; Node 24 is recommended. Open the private teacher URL in the generated `data/launch.json`, or use `./Start-Classroom.ps1` on Windows. No model is configured by default. Full instructions and tests: [classroom guide](apps/chalkline-classroom/README.md).
+On Windows, the bridge `Start-Classroom.ps1` accepts `-ClassroomRoot` and `-DataDirectory`. Sign in using the initial credentials in the private data directory's `bootstrap.json`; do not publish that file. Full account, private HTTPS, AI, video and recovery instructions are in the [classroom guide](https://github.com/lEWFkRAD/onyx-chalkline/blob/main/classroom/README.md).
 
-Teacher authoring, reviewed assignment snapshots, student lessons and help, saved work, submissions, feedback and question review persist in local SQLite. Narrated MP4 generation currently needs Windows System.Speech and FFmpeg. This is a single-computer synthetic prototype, with four demo learners and Grade 3 unit-fraction visuals.
+The classroom supports teacher-owned classes, individual student sign-ins, reviewed lesson snapshots, HTML activities, Windows narrated videos, assignments, AI questions, saved work, submissions and teacher feedback. Sessions expire and can be revoked. Students' unfinished answers survive an interrupted connection, and retries do not duplicate committed work. The current teaching format remains a synthetic Grade 3 unit-fractions demonstration.
 
 ## Build the native teacher app
 
-Follow the upstream [desktop build requirements](apps/desktop/BUILDING.md) for the Python backend, root workspace dependencies, Electron and platform tooling. Install Node dependencies from the repository root as described there. This branch's desktop scripts select the Chalkline product profile and port 5194; the classroom service uses 5195.
+Follow the upstream [desktop build requirements](apps/desktop/BUILDING.md) for the Python backend, root workspace dependencies, Electron and platform tooling. Install Node dependencies from the repository root. This branch selects the Chalkline product profile and desktop development port 5194; the companion uses 5195.
 
-Start the classroom separately, then run the desktop development command from the root:
+Start the companion separately, then run:
 
 ```sh
 npm run dev --workspace apps/desktop
-```
-
-For a renderer/Electron production build:
-
-```sh
+# Or build renderer and Electron assets:
 npm run build --workspace apps/desktop
 ```
 
-The Classroom tab accepts the private desktop access link copied from the teacher browser view. It connects only to `http://127.0.0.1:5195`. The classroom launcher does not start Hermes, install its dependencies or configure providers. Keep a separate Hermes profile/home and desktop data directory when running alongside an existing Hermes installation; use the documented upstream environment configuration for your platform.
+The Classroom tab opens the shared sign-in page at `http://127.0.0.1:5195`. Teachers can sign in there directly or paste an expiring teacher session link copied from their browser classroom. The native connector deliberately pins this loopback address. Learners on other devices open the configured private HTTPS browser address instead.
 
-Native identity is `com.onyxintelligence.chalkline`, product name Chalkline and protocol `chalkline://`. The fork does not inherit the standard Hermes release feed. No installer binary or machine-specific launcher is published here.
+Keep a separate Hermes home/profile and desktop data directory when running alongside another Hermes installation. The classroom launcher does not start Hermes, install its dependencies or configure providers. Native identity is `com.onyxintelligence.chalkline`; the fork does not inherit the standard Hermes release feed. No prebuilt installer is published here.
 
-## Verification and limits
+## Verification and scope
 
-Before publication, the source product passed 52 focused desktop startup/identity tests, renderer/Electron type checks, lint, production build and Windows unpacked packaging. The connected access component test and the full teacher/student browser cycle also passed. Real model drafting/tutoring and Windows video playback/captions were tested locally with synthetic data. See the classroom guide for scope and reproducible checks; CI covers deterministic HTTP and browser behavior without a live model.
+The companion's deterministic HTTP, database migration, recovery and browser checks live with its source. This branch's classroom workflow checks the pinned source revision. Native component checks cover the restricted connection URL and product identity; build/type checks cover the renderer and Electron integration.
 
-Desktop screenshots were not verified in that local run; browser screenshots were. There is no school deployment, real roster integration or cross-device login in this version.
-
-[Standalone public Chalkline repository](https://github.com/lEWFkRAD/onyx-chalkline) includes the same classroom companion and the earlier evidence workspace.
+Use fictional learners for this private demonstration. District identity, broader lesson formats, retention/deletion, accessibility evaluation, operational monitoring and real-school approval remain later stages. Private device access is supported; it does not make this a production student-record system.

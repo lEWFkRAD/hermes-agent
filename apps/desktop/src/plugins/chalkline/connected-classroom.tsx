@@ -27,28 +27,36 @@ export function ConnectedClassroom() {
     <section className="chalkline-classroom">
       <div className="chalkline-classroom__connect">
         <p>{t('connectionHint')}</p>
-        <form
-          onSubmit={event => {
-            event.preventDefault()
-            connect()
-          }}
-        >
-          <Input
-            aria-label={t('accessLabel')}
-            autoComplete="off"
-            onChange={event => setAccess(event.target.value)}
-            placeholder={t('accessLabel')}
-            type="password"
-            value={access}
-          />
-          <Button type="submit">{t('connect')}</Button>
-          <Button onClick={() => setSource(CLASSROOM_ORIGIN + '/?reload=' + Date.now())} type="button" variant="ghost">
-            {t('reload')}
-          </Button>
-        </form>
+        <details>
+          <summary>{t('sessionHeading')}</summary>
+          <form
+            onSubmit={event => {
+              event.preventDefault()
+              connect()
+            }}
+          >
+            <Input
+              aria-label={t('accessLabel')}
+              autoComplete="off"
+              onChange={event => setAccess(event.target.value)}
+              placeholder={t('accessLabel')}
+              type="password"
+              value={access}
+            />
+            <Button type="submit">{t('connect')}</Button>
+            <Button
+              onClick={() => setSource(CLASSROOM_ORIGIN + '/?reload=' + Date.now())}
+              type="button"
+              variant="ghost"
+            >
+              {t('reload')}
+            </Button>
+          </form>
+        </details>
         {error && <p role="alert">{t('invalidCode')}</p>}
       </div>
       <iframe
+        allow="clipboard-write"
         className="chalkline-classroom__frame"
         key={source}
         referrerPolicy="no-referrer"
