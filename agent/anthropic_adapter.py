@@ -243,6 +243,59 @@ _OAUTH_ONLY_BETAS = ["claude-code-20250219", "oauth-2025-04-20"]
 _CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
 _claude_code_version_cache: Optional[str] = None
 
+# ASCII-only, anchored fullmatch: the value lands in an HTTP header, so a trailing
+# newline ("2.1.400\n" — `$` in Python matches before a lone trailing \n) or a
+# non-ASCII digit ("٢.١.٤٠٠") must never reach it (LocalProtocolError /
+# UnicodeEncodeError on every request for the process lifetime).
+_CLAUDE_CODE_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.]+)?")
+
+
+def _claude_code_version_ok(version: Any) -> bool:
+    """True only for a strictly ASCII, well-formed version string."""
+    return isinstance(version, str) and _CLAUDE_CODE_VERSION_RE.fullmatch(version) is not None
+
+
+def _claude_code_version_tuple(version: str) -> Optional[tuple]:
+    """``"2.1.74"`` -> ``(2, 1, 74)``; None when any component is non-numeric."""
+    with suppress(ValueError):
+        return tuple(int(part) for part in version.split("."))
+    return None
+
+
+def _claude_code_version_cache_path():
+    """Machine-level sidecar for the last successful detection.
+
+    Keyed on the default Hermes root, NOT the profile home: the installed CLI
+    version belongs to the machine, so every profile shares one record.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "cache" / "claude_code_version.json"
+
+
+def _read_recorded_claude_code_version() -> Optional[str]:
+    """The last successfully detected version, or None. Never raises."""
+    try:
+        from utils import read_json_or_empty
+
+        recorded = read_json_or_empty(_claude_code_version_cache_path()).get("version")
+        return recorded if _claude_code_version_ok(recorded) else None
+    except Exception:
+        return None
+
+
+def _record_claude_code_version(version: str) -> None:
+    """Persist a successful detection atomically; never raises into the OAuth path."""
+    try:
+        from utils import atomic_json_write, read_json_or_empty
+
+        path = _claude_code_version_cache_path()
+        if read_json_or_empty(path).get("version") == version:
+            return  # unchanged: skip the rewrite
+        atomic_json_write(path, {"version": version})
+    except Exception:
+        logger.debug("could not persist Claude Code version %r", version, exc_info=True)
+
 # Install prefixes probed in addition to PATH. GUI launches (the Electron desktop app, macOS
 # LaunchAgents) inherit the bare ``/usr/bin:/bin:/usr/sbin:/sbin``, which carries none of these,
 # so a PATH-only lookup finds nothing there even with the CLI installed — detection then returns
@@ -302,16 +355,49 @@ def _detect_claude_code_version() -> str:
             )
             if result.returncode == 0 and result.stdout.strip():
                 version = result.stdout.strip().split()[0]  # "2.1.74 (Claude Code)" or "2.1.74"
-                if version and version[0].isdigit():
+                # Strict fullmatch, not `version[0].isdigit()`: "2.1.300,beta" and
+                # Arabic-Indic digits both start with a digit and would otherwise
+                # reach the user-agent header unvalidated.
+                if _claude_code_version_ok(version):
                     return version
     return _CLAUDE_CODE_VERSION_FALLBACK
 
 
 def _get_claude_code_version() -> str:
-    """Detect lazily (only OAuth headers need it) and cache for the process."""
+    """Detect lazily (only OAuth headers need it) and cache for the process.
+
+    A successful detection is persisted to a machine-level sidecar; when detection
+    fails, the recorded value (if newer than the static fallback) is used instead
+    of silently downgrading the OAuth identity for the whole process lifetime
+    (#138195: a stale fallback 400s every Opus 5.5 request until restart).
+    """
     global _claude_code_version_cache
     if _claude_code_version_cache is None:
-        _claude_code_version_cache = _detect_claude_code_version()
+        detected = _detect_claude_code_version()
+        if detected != _CLAUDE_CODE_VERSION_FALLBACK:
+            _record_claude_code_version(detected)
+            _claude_code_version_cache = detected
+        else:
+            recorded = _read_recorded_claude_code_version()
+            if (
+                recorded is not None
+                and (_claude_code_version_tuple(recorded) or ())
+                >= (_claude_code_version_tuple(_CLAUDE_CODE_VERSION_FALLBACK) or ())
+            ):
+                logger.warning(
+                    "Claude Code version detection failed; using last recorded "
+                    "identity claude-code/%s (fallback is %s)",
+                    recorded, _CLAUDE_CODE_VERSION_FALLBACK,
+                )
+                _claude_code_version_cache = recorded
+            else:
+                logger.warning(
+                    "Claude Code version detection failed and no usable recorded "
+                    "version; OAuth identity falls back to claude-code/%s — newer "
+                    "models may reject requests until detection works again",
+                    _CLAUDE_CODE_VERSION_FALLBACK,
+                )
+                _claude_code_version_cache = _CLAUDE_CODE_VERSION_FALLBACK
     return _claude_code_version_cache
 
 
