@@ -1,0 +1,18 @@
+name: sunshine-moonlight
+repo: https://github.com/lEWFkRAD/sunshine-moonlight-plugin
+sha: afcf0e9c6b6e994167dc9a39c1360922d5ccbabb
+subdir: ""
+description: Set up and diagnose Moonlight game streaming (Sunshine host <-> Moonlight client) between machines that run Hermes.
+maintainer: lEWFkRAD
+tier: community
+category: tools
+requires_hermes: ">=0.15.1"
+version: "0.1.0"
+readme: true
+platforms: [linux]
+capabilities:
+  provides_tools:
+    - game_stream
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []
