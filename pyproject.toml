@@ -38,7 +38,7 @@ dependencies = [
   # user picks that backend. Smaller `dependencies` = smaller blast
   # radius for the next supply-chain attack.
   "openai==2.24.0; python_version >= '3.14'",
-  "certifi==2026.5.20; python_version >= '3.14'",
+  "certifi==2026.10.19; python_version >= '3.14'",
   # TLS trust comes from the OS certificate store (agent/ssl_verify.py), so
   # a corporate/internal root installed on the machine just works. certifi
   # above stays a direct pin because httpx/requests/openai each depend on
@@ -595,12 +595,14 @@ kittentts = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platf
 piper = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')"
 
 [tool.uv]
+# emSign emergency floor; preserve upper bounds and the global quarantine.
+constraint-dependencies = ["pip>=26.2.2,<27", "certifi>=2026.10.19,<2027"]
 # uv otherwise enables the dev group by default, including in payload builds.
 default-groups = []
 # 3.11 is an install bridge for pre-PM updaters, never a runtime, so the lock
 # covers 3.14 only. Without this the lock must resolve every supported version,
 # where extras that only ever coexist on 3.14 (kittentts vs neutts) conflict.
-environments = ["python_version >= '3.14'"]
+environments = ["python_version >= '3.14' and sys_platform != 'android'"]
 override-dependencies = [
   # discord.py's latest published version, 2.7.1, pins pynacl at <1.6. however, pynacl 1.5.0 has known vulnerabilities.
   # discord.py has updated pynacl to 1.6 on `main`, but has not yet published a patch release.
@@ -678,6 +680,7 @@ exclude-newer = "14 days"
 # 14-day window is younger than the reviewed release.
 
 [tool.uv.exclude-newer-package]
+pip = "2026-10-22T00:00:00Z"
 agent-client-protocol = false
 aiohttp = false
 aiohttp-socks = false
@@ -689,7 +692,7 @@ azure-identity = false
 boto3 = false
 brotlicffi = false
 browser-harness = false
-certifi = false
+certifi = "2026-10-22T00:00:00Z"
 concurrent-log-handler = false
 croniter = false
 cryptography = false
