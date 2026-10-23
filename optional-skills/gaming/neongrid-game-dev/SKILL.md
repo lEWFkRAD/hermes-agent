@@ -83,9 +83,14 @@ reports a win rate inside the target band (default 40-60%).
 
 ### 4. Asset generation (optional)
 
-Generate prompts and a batch script from the game data export, run the
-text-to-image → image-to-3D pipeline, then import. Completion criterion: every
-unit class in the export has a corresponding asset manifest entry.
+Generate prompts from the game data export, then run image → 3D on the Mac
+mini asset-gen host (not a cloud mesh API). The host runs a private ComfyUI
+plus a stdlib gateway exposing `POST /v1/image-to-3d` (JSON: `image_b64`,
+`name`, `seed`, `steps` → `glb_b64` + provenance meta); it listens on
+localhost only, bearer-token gated, reached through an SSH tunnel. Each job
+takes ~4 minutes on MPS and appends an audit line to `jobs.jsonl`. Completion
+criterion: every unit class in the export has a GLB whose `glb_sha256`
+appears in the job audit log.
 
 ### 5. UE integration (optional)
 
