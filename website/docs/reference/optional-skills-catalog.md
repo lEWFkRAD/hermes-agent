@@ -138,6 +138,7 @@ hermes skills uninstall <skill-name>
 | Skill | Description |
 |-------|-------------|
 | [**minecraft-modpack-server**](../user-guide/skills/optional/gaming/gaming-minecraft-modpack-server.md) | Host modded Minecraft servers (CurseForge, Modrinth). |
+| [**neongrid-game-dev**](../user-guide/skills/optional/gaming/gaming-neongrid-game-dev.md) | Build and test a tactical roguelite with a Python sim core. |
 | [**pokemon-player**](../user-guide/skills/optional/gaming/gaming-pokemon-player.md) | Play Pokemon via headless emulator + RAM reads. |
 
 ## health
