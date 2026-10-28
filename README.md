@@ -1,3 +1,12 @@
+<!-- project-home:start -->
+**[Hermes Agent project homepage](https://lewfkrad.github.io/hermes-agent/)** · [Documentation](https://hermes-agent.nousresearch.com/docs/)
+
+A contribution fork of the personal AI agent built by Nous Research.
+
+> Fork of NousResearch/hermes-agent. Upstream documentation is the authority for installation and support. MIT.
+
+<!-- project-home:end -->
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
